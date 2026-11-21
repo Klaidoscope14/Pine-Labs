@@ -119,7 +119,10 @@ phase2-live: build ## SPENDS MONEY: live runs (5x Demo 1, protected file, kill s
 	@$(SECRETS_ENV) PARALLEL=$(PARALLEL) scripts/phase2-live.sh $(LOGS) $(or $(RUNS),5) $(or $(LIVE_CONFIG),config.bedrock.yaml)
 
 # ---------------- AWS (PLAN.md §10.4) ----------------
-.PHONY: deploy deploy-tunnel
+.PHONY: aws deploy deploy-tunnel
+
+aws: ## All AWS operations in one script: make aws CMD="check|key|deploy|stack|verify|result|logs|shell|tunnel 3000|start|stop|drift"
+	@scripts/aws.sh $(CMD)
 
 deploy: ## Create/update the EC2 stack and (re)deploy this working tree: AWS_REGION=<india-region> make deploy
 	@scripts/aws-deploy.sh

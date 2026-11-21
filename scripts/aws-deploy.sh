@@ -6,6 +6,7 @@
 # The model API key must already be in SSM: see the "put the key" command printed below.
 set -euo pipefail
 : "${AWS_REGION:?set AWS_REGION to your India region}"
+export AWS_PAGER=""   # never open a pager for CLI output
 stack="${STACK:-aegis}"
 itype="${INSTANCE_TYPE:-m7g.2xlarge}"
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,7 +28,7 @@ instance="$(out InstanceId)"; bucket="$(out BundleBucket)"
 
 echo "== bundling the working tree (tracked + untracked, never ignored files such as secrets)"
 bundle="$(mktemp -t aegis-bundle).tgz"
-(cd "$root" && git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --null -T - -czf "$bundle")
+(cd "$root" && git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata --no-fflags --null -T - -czf "$bundle")
 key="bundles/$(date +%Y%m%d-%H%M%S).tgz"
 aws_ s3 cp "$bundle" "s3://$bucket/$key" --only-show-errors
 rm -f "$bundle"
@@ -38,12 +39,32 @@ for _ in $(seq 1 60); do
   sleep 10
 done
 
-echo "== installing and starting on the instance (takes several minutes the first time)"
+echo "== installing and starting on the instance (a few minutes; first deploy longer)"
+remote="aws s3 cp s3://$bucket/$key /tmp/aegis.tgz --region $AWS_REGION --only-show-errors && mkdir -p /opt/aegis/src && tar --warning=no-unknown-keyword -xzf /tmp/aegis.tgz -C /opt/aegis/src && /opt/aegis/src/scripts/aws-remote-setup.sh $AWS_REGION 2>&1 | tee /opt/aegis/setup.log; exit \${PIPESTATUS[0]}"
 cmd_id="$(aws_ ssm send-command --instance-ids "$instance" --document-name AWS-RunShellScript \
   --timeout-seconds 3600 --comment "aegis deploy $key" \
-  --parameters "commands=[\"sudo -iu ec2-user bash -lc 'aws s3 cp s3://$bucket/$key /tmp/aegis.tgz --region $AWS_REGION && mkdir -p /opt/aegis/src && tar -xzf /tmp/aegis.tgz -C /opt/aegis/src && /opt/aegis/src/scripts/aws-remote-setup.sh $AWS_REGION'\"]" \
+  --parameters "$(jq -cn --arg c "echo $(printf '%s' "$remote" | base64 | tr -d '\n') | base64 -d > /tmp/aegis-cmd.sh && chmod 644 /tmp/aegis-cmd.sh && sudo -iu ec2-user bash -l /tmp/aegis-cmd.sh; rc=\$?; rm -f /tmp/aegis-cmd.sh; exit \$rc" '{commands:[$c], executionTimeout:["3600"]}')" \
   --query Command.CommandId --output text)"
-aws_ ssm wait command-executed --command-id "$cmd_id" --instance-id "$instance" || true
-aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$instance" \
-  --query '{status:Status,out:StandardOutputContent,err:StandardErrorContent}' --output json
-echo "instance: $instance   shell: aws ssm start-session --target $instance --region $AWS_REGION"
+
+# Poll (the CLI waiter gives up after ~100 s), showing elapsed time.
+start=$(date +%s)
+while :; do
+  status="$(aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$instance" --query Status --output text 2>/dev/null || echo Pending)"
+  case "$status" in Pending|InProgress|Delayed) printf "\r   %s ... %ds" "$status" $(( $(date +%s) - start )); sleep 5 ;; *) break ;; esac
+done
+printf "\r   %s after %ds%20s\n" "$status" $(( $(date +%s) - start )) ""
+
+# Readable summary: the milestone lines only, without colour codes. Full log: scripts/aws.sh logs
+strip() { sed -E 's/\x1b\[[0-9;]*m//g'; }
+stdout="$(aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$instance" --query StandardOutputContent --output text | strip)"
+if [[ "$status" == Success ]]; then
+  echo "$stdout" | grep -E '^(  OK|  FAIL|ledger migrated|seeded |code host repo|== |[0-9.]+-gvisor|deploy complete)' | sed 's/^/   /'
+  echo
+  echo "deployed to $instance ($AWS_REGION). Full log: scripts/aws.sh logs"
+else
+  echo "deploy FAILED ($status). Last output:"
+  echo "$stdout" | tail -30 | sed 's/^/   /'
+  aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$instance" --query StandardErrorContent --output text |
+    strip | grep -v -E 'Ignoring unknown extended header|^ ?Container |^#[0-9]+ ' | tail -20 | sed 's/^/   /'
+  exit 1
+fi

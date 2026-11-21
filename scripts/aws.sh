@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# One entry point for operating AegisSDLC on AWS (PLAN.md §10.4). Uses the aws CLI.
+#
+#   scripts/aws.sh <command>
+#
+#   check     show the account, stack, instance state and whether the model key is in SSM
+#   key       put the DeepSeek key from deploy/compose/.env.secrets into SSM (never printed)
+#   deploy    ship this working tree to the instance and restart the stack (no instance restart)
+#   stack     create/update the CloudFormation stack, then deploy (an update may stop/start the instance)
+#   verify    run the Phase 2 live checks on the instance in the background (5 parallel runs)
+#   result    show the live-check summary from the instance
+#   logs      tail the instance's setup and live-check logs
+#   shell     open a shell on the instance (Session Manager)
+#   tunnel    forward an instance UI to localhost: scripts/aws.sh tunnel 3000  (3000 Grafana, 8233 Temporal, 16686 Jaeger)
+#   start     start the instance
+#   stop      stop the instance (data stays on the disk; billing for compute stops)
+#   drift     detect CloudFormation drift (console changes not in the template)
+#
+# Settings (environment): AWS_PROFILE (default aegis-bedrock), AWS_REGION (default ap-south-1),
+# STACK (default aegis), INSTANCE_TYPE (default m7g.2xlarge), EXPECT_ACCOUNT (refuse other accounts).
+set -euo pipefail
+export AWS_PROFILE="${AWS_PROFILE:-aegis-bedrock}"
+export AWS_REGION="${AWS_REGION:-ap-south-1}"
+export AWS_PAGER=""
+STACK="${STACK:-aegis}"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cmd="${1:-help}"
+
+die() { echo "error: $*" >&2; exit 1; }
+out() { aws cloudformation describe-stacks --stack-name "$STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text 2>/dev/null; }
+instance() { local id; id="$(out InstanceId)"; [[ -n "$id" && "$id" != None ]] || die "stack $STACK has no instance (run: scripts/aws.sh stack)"; echo "$id"; }
+
+account_guard() {
+  local acct; acct="$(aws sts get-caller-identity --query Account --output text)" || die "not signed in (aws login --profile $AWS_PROFILE)"
+  if [[ -n "${EXPECT_ACCOUNT:-}" && "$acct" != "$EXPECT_ACCOUNT" ]]; then
+    die "signed in to account $acct, expected $EXPECT_ACCOUNT"
+  fi
+  echo "$acct"
+}
+
+# run_remote "<shell commands>": runs as ec2-user on the instance, waits, prints output.
+# The script travels base64-encoded and is piped into a login shell, so no quoting
+# layer (local shell, SSM, sudo -i) can mangle it.
+run_remote() {
+  local id cid status
+  id="$(instance)"
+  cid="$(aws ssm send-command --instance-ids "$id" --document-name AWS-RunShellScript \
+    --timeout-seconds 3600 --parameters "$(jq -cn --arg c "echo $(printf '%s' "$1" | base64 | tr -d '\n') | base64 -d > /tmp/aegis-cmd.sh && chmod 644 /tmp/aegis-cmd.sh && sudo -iu ec2-user bash -l /tmp/aegis-cmd.sh; rc=\$?; rm -f /tmp/aegis-cmd.sh; exit \$rc" '{commands:[$c], executionTimeout:["3600"]}')" \
+    --query Command.CommandId --output text)"
+  for _ in $(seq 1 360); do
+    status="$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query Status --output text 2>/dev/null || echo Pending)"
+    case "$status" in Pending|InProgress|Delayed) sleep 5 ;; *) break ;; esac
+  done
+  aws ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query StandardOutputContent --output text
+  local err; err="$(aws ssm get-command-invocation --command-id "$cid" --instance-id "$id" --query StandardErrorContent --output text)"
+  [[ -z "$err" || "$err" == None ]] || echo "$err" | grep -v "Ignoring unknown extended header" >&2 || true
+  [[ "$status" == Success ]] || die "remote command ended: $status"
+}
+
+command -v aws >/dev/null || die "aws CLI not found"
+command -v jq >/dev/null || die "jq not found"
+
+case "$cmd" in
+  check)
+    echo "account:  $(account_guard)   region: $AWS_REGION   profile: $AWS_PROFILE"
+    if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+      id="$(instance)"
+      echo "stack:    $STACK ($(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text))"
+      echo "instance: $id $(aws ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].[InstanceType,State.Name]' --output text)"
+      echo "ssm:      $(aws ssm describe-instance-information --filters "Key=InstanceIds,Values=$id" --query 'InstanceInformationList[0].PingStatus' --output text)"
+    else
+      echo "stack:    $STACK does not exist yet (scripts/aws.sh stack)"
+    fi
+    if aws ssm get-parameter --name /aegis/deploy-api-key --query Parameter.Name --output text >/dev/null 2>&1; then
+      echo "key:      /aegis/deploy-api-key present"
+    else
+      echo "key:      missing (scripts/aws.sh key)"
+    fi
+    ;;
+
+  key)
+    account_guard >/dev/null
+    secrets="$root/deploy/compose/.env.secrets"
+    grep -q '^DEPLOY_API_KEY=' "$secrets" 2>/dev/null || die "DEPLOY_API_KEY not in $secrets"
+    # Piped via stdin so the key never appears on a command line or in output.
+    grep '^DEPLOY_API_KEY=' "$secrets" | cut -d= -f2- | tr -d '\n' |
+      aws ssm put-parameter --name /aegis/deploy-api-key --type SecureString --value file:///dev/stdin --overwrite --query Version --output text |
+      sed 's/^/stored \/aegis\/deploy-api-key, version /'
+    ;;
+
+  deploy)
+    account_guard >/dev/null
+    SKIP_STACK=1 "$root/scripts/aws-deploy.sh"
+    ;;
+
+  stack)
+    account_guard >/dev/null
+    "$root/scripts/aws-deploy.sh"
+    ;;
+
+  verify)
+    run_remote "sudo systemctl reset-failed aegis-live >/dev/null 2>&1 || true
+      if systemctl is-active --quiet aegis-live; then echo 'a live check is already running'; exit 0; fi
+      sudo systemd-run --unit=aegis-live --uid=ec2-user --gid=ec2-user --setenv=HOME=/home/ec2-user \
+        bash -c 'cd /opt/aegis/src && export PATH=/usr/local/go/bin:\$PATH && date -u +%FT%TZ > /opt/aegis/live.start && make phase2-live LIVE_CONFIG=config.aws.yaml RUNS=5 PARALLEL=1 > /opt/aegis/live.log 2>&1; echo exit=\$? >> /opt/aegis/live.log'
+      echo 'live check started (about 10-15 minutes); see: scripts/aws.sh result'"
+    ;;
+
+  result)
+    run_remote "echo \"running: \$(systemctl is-active aegis-live)  started: \$(cat /opt/aegis/live.start 2>/dev/null)\"
+      grep -E 'live-(happy|protected)-[0-9a-f]{8} |of [0-9]+ approved|killed run|summary|exit=' /opt/aegis/live.log 2>/dev/null | cut -c1-200 || echo 'no live check has run yet'"
+    ;;
+
+  logs)
+    run_remote "echo '== setup'; tail -15 /opt/aegis/setup.log 2>/dev/null; echo '== live'; tail -25 /opt/aegis/live.log 2>/dev/null"
+    ;;
+
+  shell)
+    aws ssm start-session --target "$(instance)"
+    ;;
+
+  tunnel)
+    port="${2:-3000}"
+    echo "forwarding localhost:$port -> instance:$port (Ctrl-C to stop)"
+    aws ssm start-session --target "$(instance)" --document-name AWS-StartPortForwardingSession \
+      --parameters "portNumber=$port,localPortNumber=$port"
+    ;;
+
+  start)
+    id="$(instance)"; aws ec2 start-instances --instance-ids "$id" >/dev/null
+    aws ec2 wait instance-running --instance-ids "$id"; echo "started $id"
+    ;;
+
+  stop)
+    id="$(instance)"; aws ec2 stop-instances --instance-ids "$id" >/dev/null
+    aws ec2 wait instance-stopped --instance-ids "$id"; echo "stopped $id (disk kept)"
+    ;;
+
+  drift)
+    did="$(aws cloudformation detect-stack-drift --stack-name "$STACK" --query StackDriftDetectionId --output text)"
+    for _ in $(seq 1 60); do
+      st="$(aws cloudformation describe-stack-drift-detection-status --stack-drift-detection-id "$did" --query DetectionStatus --output text)"
+      [[ "$st" == DETECTION_IN_PROGRESS ]] || break; sleep 3
+    done
+    aws cloudformation describe-stack-drift-detection-status --stack-drift-detection-id "$did" --query '[StackDriftStatus,DriftedStackResourceCount]' --output text
+    aws cloudformation describe-stack-resource-drifts --stack-name "$STACK" --stack-resource-drift-status-filters MODIFIED DELETED \
+      --query 'StackResourceDrifts[].[LogicalResourceId,StackResourceDriftStatus]' --output text
+    ;;
+
+  help|-h|--help)
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+
+  *)
+    die "unknown command '$cmd' (scripts/aws.sh help)"
+    ;;
+esac
