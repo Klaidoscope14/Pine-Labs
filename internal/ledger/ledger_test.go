@@ -16,6 +16,7 @@ import (
 
 	"aegis/internal/config"
 	"aegis/internal/gates"
+	"aegis/internal/llm"
 )
 
 // Integration tests against the local Postgres. Each test run uses a fresh,
@@ -233,5 +234,60 @@ func TestFindingsResolveAcrossCommits(t *testing.T) {
 	}
 	if got["FIN-001"] != "RESOLVED" || got["FIN-004"] != "PRE_EXISTING" {
 		t.Fatalf("statuses = %v", got)
+	}
+}
+
+func TestKillSwitchScopesAndAppCannotChangeIt(t *testing.T) {
+	s, adminDSN := setup(t)
+	ctx := context.Background()
+	if on, _, _ := s.KillActive(ctx, "t1"); on {
+		t.Fatal("kill switch on by default")
+	}
+	if err := SetKill(ctx, adminDSN, "t2", true, "incident", "ops"); err != nil {
+		t.Fatal(err)
+	}
+	if on, _, _ := s.KillActive(ctx, "t1"); on {
+		t.Error("t2's switch stopped t1")
+	}
+	if on, reason, _ := s.KillActive(ctx, "t2"); !on || reason != "incident" {
+		t.Errorf("t2 switch = %v %q", on, reason)
+	}
+	if err := SetKill(ctx, adminDSN, "*", true, "global stop", "ops"); err != nil {
+		t.Fatal(err)
+	}
+	if on, _, _ := s.KillActive(ctx, "t1"); !on {
+		t.Error("global switch did not stop t1")
+	}
+	err := s.tx(ctx, "t1", func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE kill_switch SET active = false`)
+		return err
+	})
+	if err == nil {
+		t.Error("app role turned the kill switch off")
+	}
+}
+
+func TestRunSpendAndUsage(t *testing.T) {
+	s, _ := setup(t)
+	ctx := context.Background()
+	newRun(t, s, "t1", "r1")
+	c := 0.5
+	for i := 0; i < 2; i++ {
+		if err := s.RecordLLMCall(ctx, llm.CallRecord{TenantID: "t1", RunID: "r1", Role: "developer", Provider: "p",
+			Model: "m", InputTokens: 100, OutputTokens: 10, CostUSD: &c, InferenceGeo: "in"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tokens, usd, err := s.RunSpend(ctx, "t1", "r1")
+	if err != nil || tokens != 220 || usd != 1.0 {
+		t.Fatalf("spend = %d %v %v", tokens, usd, err)
+	}
+	if other, _, _ := s.RunSpend(ctx, "t2", "r1"); other != 0 {
+		t.Error("another tenant can see spend")
+	}
+	_ = s.RecordToolCall(ctx, ToolCall{TenantID: "t1", RunID: "r1", Role: "developer", Tool: "edit_file", ArgsHash: "h", Allowed: false, Reason: "protected"})
+	u, err := s.RunUsage(ctx, "t1", "r1")
+	if err != nil || u.Calls != 2 || u.DeniedToolCalls != 1 || u.CostUSD == nil || *u.CostUSD != 1.0 || len(u.Regions) != 1 {
+		t.Fatalf("usage = %+v %v", u, err)
 	}
 }

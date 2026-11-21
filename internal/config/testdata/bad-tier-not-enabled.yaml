@@ -20,15 +20,44 @@ endpoints:
   - { name: otel,         kind: telemetry,      url: "127.0.0.1:4317",        jurisdiction: IN }
   - { name: egress-proxy, kind: egress_proxy,   url: "127.0.0.1:4750",        jurisdiction: IN }
   - { name: code-host,    kind: code_host,      url: "file://./.data/git",    jurisdiction: IN }
-  - { name: llm-fake,     kind: llm,            url: "http://127.0.0.1:9900", jurisdiction: IN }
+  - { name: llm-bedrock-india, kind: llm,        url: "https://bedrock-runtime.ap-south-1.amazonaws.com", jurisdiction: IN }
+  - { name: llm-fake,     kind: llm,            url: "file://./evals/cassettes", jurisdiction: IN }
 
 llm:
   providers:
-    - name: fake
+    - name: replay
+      kind: replay
       endpoint: llm-fake
       api_key_ref: env:AEGIS_LLM_FAKE_KEY
-      models: { analyst: fake-small, architect: fake-large, developer: fake-large, release: fake-small }
-  fallback_order: [fake]
+      cassette_dir: evals/cassettes
+      models: { analyst: recorded, architect: recorded, developer: recorded, release: recorded }
+    # Claude on Amazon Bedrock through the India geographic inference profile
+    # (routes only between the two India regions). Used when listed in fallback_order.
+    - name: bedrock-india
+      kind: bedrock
+      endpoint: llm-bedrock-india
+      api_key_ref: env:AWS_PROFILE
+      # The AWS profile (in ~/.aws/config) whose account pays for Bedrock. Set it to the
+      # account you choose; "default" is refused so the wrong account is never used by accident.
+      aws_profile: aegis-bedrock
+      region: ap-south-1
+      verify_profile_routing: true
+      allowed_regions: [ap-south-1, ap-south-2]
+      price_table_ref: prices/bedrock-india.yaml
+      record: true                 # keep responses for offline replay (refused in production)
+      cassette_dir: evals/cassettes
+      models:
+        analyst: in.anthropic.claude-opus-5
+        architect: in.anthropic.claude-opus-5
+        developer: in.anthropic.claude-opus-5
+        release: in.anthropic.claude-opus-5
+  fallback_order: [replay]
+  max_retries: 2
+  roles:
+    analyst:   { effort: low,  max_tokens: 16000 }
+    architect: { effort: high, max_tokens: 16000 }
+    developer: { effort: high, max_tokens: 16000 }
+    release:   { effort: low,  max_tokens: 8000 }
 
 workflow: { max_ci_rounds: 2, max_schema_repairs: 2, max_arbitration_rounds: 1 }
 budget: { per_run_tokens: 2000000, per_run_usd: 5, per_tenant_daily_usd: 100 }
@@ -59,7 +88,6 @@ gates:
   tier1: [scope, lint, tests]
   security: [semgrep, bandit, secrets, dependencies]
   tier2: [hidden_tests, openapi, replay]
-  # tier lists gates that are not enabled
   parallelism: 3
   semgrep_rules_dir: rules/semgrep
   rules_ref: fin-rules-v0
@@ -87,6 +115,14 @@ evals:
   hidden_tests_dir: evals/hidden/pine-settlements-svc
   replay_dir: evals/replay/pine-settlements-svc
   scenarios_dir: evals/scenarios
+agents:
+  mode: stub
+  max_tool_calls: 40
+  max_read_bytes: 65536
+  max_run_tests: 4
+  max_context_bytes: 200000
+  prompts_dir: prompts
+  import_graph_script: tools/importgraph.py
 slo: {}
 load: { concurrent_runs: 50 }
 policy: { bundle_ref: approvals-v0 }

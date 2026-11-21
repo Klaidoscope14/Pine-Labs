@@ -12,8 +12,13 @@ import (
 	"go.temporal.io/sdk/client"
 	tlog "go.temporal.io/sdk/log"
 
+	"aegis/internal/agents"
+	"aegis/internal/agents/llmagents"
+	"aegis/internal/agents/stub"
 	"aegis/internal/config"
 	"aegis/internal/ledger"
+	"aegis/internal/llm"
+	"aegis/internal/sandbox"
 	"aegis/internal/workflow"
 	"aegis/internal/workspace"
 )
@@ -66,3 +71,32 @@ func Settings(cfg *config.Config) workflow.Settings {
 
 // WorkflowName is the registered name of the blueprint workflow.
 const WorkflowName = "AegisRun"
+
+// Agents builds the configured agent implementation (stub or Claude-backed).
+func Agents(ctx context.Context, cfg *config.Config, store *ledger.Store, sb sandbox.Provider) (agents.Agents, error) {
+	if cfg.Agents.Mode != "llm" {
+		return stub.Agents{Root: cfg.Path(cfg.Evals.ScenariosDir)}, nil
+	}
+	providers, err := llm.Build(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	prices := map[string]llm.Price{}
+	for _, name := range cfg.LLM.FallbackOrder {
+		p, _ := cfg.Provider(name)
+		if p.PriceTableRef == "" {
+			continue
+		}
+		table, err := llm.LoadPrices(cfg.Path(p.PriceTableRef))
+		if err != nil {
+			return nil, fmt.Errorf("price table for %s: %w", name, err)
+		}
+		for model, price := range table {
+			prices[model] = price
+		}
+	}
+	router := &llm.Router{Providers: providers, Ledger: store, Roles: cfg.LLM.Roles, Budget: cfg.Budget,
+		Prices: prices, Timeout: 10 * time.Minute}
+	audit := func(ctx context.Context, c ledger.ToolCall) { _ = store.RecordToolCall(ctx, c) }
+	return llmagents.New(router, cfg, sb, cfg.Sandbox.Image, audit)
+}

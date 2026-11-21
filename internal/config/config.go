@@ -49,6 +49,7 @@ type Config struct {
 	Ledger        Ledger             `json:"ledger"`
 	Repos         []Repo             `json:"repos"`
 	Evals         Evals              `json:"evals"`
+	Agents        Agents             `json:"agents"`
 
 	// BaseDir is the directory of the config file; relative paths resolve against it.
 	BaseDir string `json:"-"`
@@ -76,16 +77,42 @@ type Endpoint struct {
 }
 
 type LLM struct {
-	Providers     []Provider `json:"providers"`
-	FallbackOrder []string   `json:"fallback_order"`
+	Providers     []Provider              `json:"providers"`
+	FallbackOrder []string                `json:"fallback_order"`
+	Roles         map[string]RoleSettings `json:"roles"`
+	MaxRetries    int                     `json:"max_retries"`
 }
 
 type Provider struct {
-	Name          string            `json:"name"`
-	Endpoint      string            `json:"endpoint"`
-	APIKeyRef     string            `json:"api_key_ref"`
-	Models        map[string]string `json:"models"`
-	PriceTableRef string            `json:"price_table_ref,omitempty"`
+	Name                 string            `json:"name"`
+	Kind                 string            `json:"kind"` // anthropic | bedrock | replay
+	Endpoint             string            `json:"endpoint"`
+	APIKeyRef            string            `json:"api_key_ref"`
+	Models               map[string]string `json:"models"`
+	PriceTableRef        string            `json:"price_table_ref,omitempty"`
+	Region               string            `json:"region,omitempty"`
+	AWSProfile           string            `json:"aws_profile,omitempty"`
+	CassetteDir          string            `json:"cassette_dir,omitempty"`
+	Record               bool              `json:"record,omitempty"`
+	VerifyProfileRouting bool              `json:"verify_profile_routing,omitempty"`
+	AllowedRegions       []string          `json:"allowed_regions,omitempty"`
+}
+
+// RoleSettings tunes one agent role.
+type RoleSettings struct {
+	Effort    string `json:"effort"`
+	MaxTokens int    `json:"max_tokens"`
+}
+
+// Agents configures how agents run.
+type Agents struct {
+	Mode              string `json:"mode"` // stub | llm
+	MaxToolCalls      int    `json:"max_tool_calls"`
+	MaxReadBytes      int    `json:"max_read_bytes"`
+	MaxRunTests       int    `json:"max_run_tests"`
+	MaxContextBytes   int    `json:"max_context_bytes"`
+	PromptsDir        string `json:"prompts_dir"`
+	ImportGraphScript string `json:"import_graph_script"`
 }
 
 type Workflow struct {
@@ -236,9 +263,9 @@ func schema() (*jsonschema.Schema, error) {
 
 // LoadFile reads, validates and guards a YAML config file.
 func LoadFile(path string) (*Config, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := resolveExtends(path, 0)
 	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, err
 	}
 	cfg, err := Parse(raw)
 	if err != nil {
@@ -250,6 +277,54 @@ func LoadFile(path string) (*Config, error) {
 	}
 	cfg.BaseDir = abs
 	return cfg, nil
+}
+
+// resolveExtends loads a config file and, if it has a top-level `extends: <file>`,
+// deep-merges it over that base (maps merge, lists and scalars replace). The merged
+// document is what gets validated, so an overlay can never skip the guards.
+func resolveExtends(path string, depth int) ([]byte, error) {
+	if depth > 4 {
+		return nil, fmt.Errorf("%w: extends chain too deep at %s", ErrInvalid, path)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	var doc map[string]any
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("%w: yaml: %v", ErrInvalid, err)
+	}
+	base, ok := doc["extends"].(string)
+	if !ok {
+		return raw, nil
+	}
+	delete(doc, "extends")
+	baseRaw, err := resolveExtends(filepath.Join(filepath.Dir(path), base), depth+1)
+	if err != nil {
+		return nil, err
+	}
+	var baseDoc map[string]any
+	if err := yaml.Unmarshal(baseRaw, &baseDoc); err != nil {
+		return nil, fmt.Errorf("%w: yaml: %v", ErrInvalid, err)
+	}
+	return yaml.Marshal(merge(baseDoc, doc))
+}
+
+func merge(base, over map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range base {
+		out[k] = v
+	}
+	for k, v := range over {
+		if bm, ok := out[k].(map[string]any); ok {
+			if om, ok := v.(map[string]any); ok {
+				out[k] = merge(bm, om)
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // Parse validates YAML bytes against the schema, then runs the semantic guards.
@@ -321,6 +396,30 @@ func (c *Config) guard() error {
 			add("llm provider %q references endpoint %q of kind %q, want llm", p.Name, p.Endpoint, e.Kind)
 		}
 	}
+	for _, p := range c.LLM.Providers {
+		switch p.Kind {
+		case "bedrock":
+			if p.Region == "" {
+				add("llm provider %q (bedrock) needs region", p.Name)
+			}
+			if p.AWSProfile == "" || p.AWSProfile == "default" {
+				add("llm provider %q (bedrock) needs an explicit aws_profile (not \"default\") so the paying account is chosen deliberately", p.Name)
+			}
+			if p.VerifyProfileRouting && len(p.AllowedRegions) == 0 {
+				add("llm provider %q verifies profile routing but lists no allowed_regions", p.Name)
+			}
+		case "replay":
+			if p.CassetteDir == "" {
+				add("llm provider %q (replay) needs cassette_dir", p.Name)
+			}
+		}
+		if p.Record && p.CassetteDir == "" {
+			add("llm provider %q records but has no cassette_dir", p.Name)
+		}
+		if p.Record && c.Deployment.Environment == "production" {
+			add("llm provider %q: recording responses is not allowed in production", p.Name)
+		}
+	}
 	for _, name := range c.LLM.FallbackOrder {
 		if !providers[name] {
 			add("llm.fallback_order lists unknown provider %q", name)
@@ -371,6 +470,16 @@ func (c *Config) guard() error {
 		return fmt.Errorf("%w:\n  - %s", ErrInvalid, strings.Join(problems, "\n  - "))
 	}
 	return nil
+}
+
+// Provider returns the named LLM provider.
+func (c *Config) Provider(name string) (Provider, bool) {
+	for _, p := range c.LLM.Providers {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return Provider{}, false
 }
 
 // Endpoint returns the named endpoint.

@@ -6,3 +6,4 @@ deploy/compose/.s3.json
 *.pyc
 .coverage
 /bin/
+evals/cassettes/**/*.sent.json

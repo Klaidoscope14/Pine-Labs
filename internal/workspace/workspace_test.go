@@ -143,3 +143,56 @@ func TestRejectsUnsafeInputs(t *testing.T) {
 		t.Error("option-like ref accepted")
 	}
 }
+
+func TestCommitWorkingIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	m := Manager{MirrorsDir: t.TempDir(), RunsDir: t.TempDir(), AuthorName: "aegis", AuthorMail: "aegis@local"}
+	mirror, _ := m.EnsureMirror(ctx, newRemote(t))
+	base, _ := m.ResolveRef(ctx, mirror, "main")
+	wt, err := m.CreateWorktree(ctx, mirror, "w1", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(wt.Path, "app", "a.py"), []byte("x = 2\n"), 0o644)
+	os.WriteFile(filepath.Join(wt.Path, "app", "new.py"), []byte("y = 1\n"), 0o644)
+	sha, err := m.CommitWorking(ctx, wt, "agent change", "k1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := m.CommitWorking(ctx, wt, "agent change", "k1"); again != sha {
+		t.Fatal("retry made a second commit")
+	}
+	changes, _ := m.Diff(ctx, wt, base, sha)
+	if len(changes) != 2 {
+		t.Fatalf("changes = %+v", changes)
+	}
+	os.WriteFile(filepath.Join(wt.Path, "junk.txt"), []byte("x"), 0o644)
+	if err := m.ResetClean(ctx, wt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(wt.Path, "junk.txt")); err == nil {
+		t.Error("ResetClean left untracked files")
+	}
+}
+
+// Regression: refreshing the mirror must never delete another run's branch.
+func TestRefreshKeepsRunBranches(t *testing.T) {
+	ctx := context.Background()
+	m := Manager{MirrorsDir: t.TempDir(), RunsDir: t.TempDir(), AuthorName: "aegis", AuthorMail: "aegis@local"}
+	remote := newRemote(t)
+	mirror, _ := m.EnsureMirror(ctx, remote)
+	base, _ := m.ResolveRef(ctx, mirror, "main")
+	wt, _ := m.CreateWorktree(ctx, mirror, "keep", base)
+	if _, err := m.ApplyAndCommit(ctx, wt, []byte(patch), "c", "k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.EnsureMirror(ctx, remote); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Head(ctx, wt); err != nil {
+		t.Fatalf("run branch lost after refresh: %v", err)
+	}
+	if n, err := m.CommitCount(ctx, wt); err != nil || n != 1 {
+		t.Fatalf("run branch damaged: %d %v", n, err)
+	}
+}

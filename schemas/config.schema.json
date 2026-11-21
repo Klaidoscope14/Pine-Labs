@@ -25,7 +25,8 @@
     "temporal",
     "ledger",
     "repos",
-    "evals"
+    "evals",
+    "agents"
   ],
   "$defs": {
     "secretRef": {
@@ -52,6 +53,30 @@
         "developer",
         "release"
       ]
+    },
+    "roleSettings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "effort",
+        "max_tokens"
+      ],
+      "properties": {
+        "effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ]
+        },
+        "max_tokens": {
+          "type": "integer",
+          "minimum": 256,
+          "maximum": 128000
+        }
+      }
     }
   },
   "properties": {
@@ -150,7 +175,9 @@
       "additionalProperties": false,
       "required": [
         "providers",
-        "fallback_order"
+        "fallback_order",
+        "roles",
+        "max_retries"
       ],
       "properties": {
         "providers": {
@@ -163,7 +190,8 @@
               "name",
               "endpoint",
               "api_key_ref",
-              "models"
+              "models",
+              "kind"
             ],
             "properties": {
               "name": {
@@ -174,7 +202,8 @@
                 "description": "Name of an entry in endpoints[] with kind llm."
               },
               "api_key_ref": {
-                "$ref": "#/$defs/secretRef"
+                "$ref": "#/$defs/secretRef",
+                "description": "Credential reference. For kind=bedrock this names the AWS profile env var (credentials come from the AWS default chain); replay ignores it."
               },
               "models": {
                 "type": "object",
@@ -206,6 +235,44 @@
               },
               "price_table_ref": {
                 "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "anthropic",
+                  "bedrock",
+                  "replay"
+                ]
+              },
+              "region": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Cloud region for kind=bedrock (an India region; set by the operator)."
+              },
+              "cassette_dir": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Where recorded responses live (kind=replay), or where to record them (record=true)."
+              },
+              "record": {
+                "type": "boolean",
+                "description": "Record real responses to cassette_dir for later offline replay."
+              },
+              "verify_profile_routing": {
+                "type": "boolean",
+                "description": "kind=bedrock: check at startup that the inference profile only routes to allowed regions."
+              },
+              "allowed_regions": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "description": "kind=bedrock: regions the inference profile may route to."
+              },
+              "aws_profile": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]+$",
+                "description": "kind=bedrock: the named AWS profile to use. Required, so the default profile is never used by accident."
               }
             }
           }
@@ -217,6 +284,35 @@
           "items": {
             "$ref": "#/$defs/name"
           }
+        },
+        "roles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "analyst",
+            "architect",
+            "developer",
+            "release"
+          ],
+          "properties": {
+            "analyst": {
+              "$ref": "#/$defs/roleSettings"
+            },
+            "architect": {
+              "$ref": "#/$defs/roleSettings"
+            },
+            "developer": {
+              "$ref": "#/$defs/roleSettings"
+            },
+            "release": {
+              "$ref": "#/$defs/roleSettings"
+            }
+          }
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 10
         }
       }
     },
@@ -749,6 +845,50 @@
           "minLength": 1
         },
         "scenarios_dir": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "max_tool_calls",
+        "max_read_bytes",
+        "max_run_tests",
+        "max_context_bytes",
+        "prompts_dir",
+        "import_graph_script"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "stub",
+            "llm"
+          ]
+        },
+        "max_tool_calls": {
+          "$ref": "#/$defs/positiveInt"
+        },
+        "max_read_bytes": {
+          "type": "integer",
+          "minimum": 1024
+        },
+        "max_run_tests": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_context_bytes": {
+          "type": "integer",
+          "minimum": 4096
+        },
+        "prompts_dir": {
+          "type": "string",
+          "minLength": 1
+        },
+        "import_graph_script": {
           "type": "string",
           "minLength": 1
         }

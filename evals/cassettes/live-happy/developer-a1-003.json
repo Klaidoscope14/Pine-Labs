@@ -1,0 +1,30 @@
+{
+  "request": null,
+  "response": {
+    "id": "msg_scripted",
+    "type": "message",
+    "role": "assistant",
+    "model": "scripted",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_scripted_004",
+        "name": "edit_file",
+        "input": {
+          "path": "app/db.py",
+          "old_text": "CREATE TABLE IF NOT EXISTS payments (",
+          "new_text": "CREATE TABLE IF NOT EXISTS processed_events (\n    event_id TEXT PRIMARY KEY,\n    processed_at TEXT NOT NULL DEFAULT (datetime('now'))\n);\nCREATE TABLE IF NOT EXISTS payments ("
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "inference_geo": "scripted"
+    }
+  }
+}

@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -35,13 +36,17 @@ func newHarness(t *testing.T, skip ...string) *harness {
 	for _, s := range skip {
 		skipped[s] = true
 	}
-	h.env.OnActivity(h.a.CreateRun, mock.Anything, mock.Anything).Return(nil)
+	if !skipped["CreateRun"] {
+		h.env.OnActivity(h.a.CreateRun, mock.Anything, mock.Anything).Return(nil)
+	}
 	h.env.OnActivity(h.a.RecordTransition, mock.Anything, mock.Anything).Return(nil)
 	h.env.OnActivity(h.a.Prepare, mock.Anything, mock.Anything).Return(WorkspaceInfo{RunID: "r1", Path: "/w", Branch: "agent/run-r1", BaseSHA: "base"}, nil)
 	if !skipped["Analyze"] {
 		h.env.OnActivity(h.a.Analyze, mock.Anything, mock.Anything).Return(AgentOutput{JSON: json.RawMessage(`{}`)}, nil)
 	}
-	h.env.OnActivity(h.a.Architect, mock.Anything, mock.Anything).Return(AgentOutput{JSON: json.RawMessage(`{}`)}, nil)
+	if !skipped["Architect"] {
+		h.env.OnActivity(h.a.Architect, mock.Anything, mock.Anything).Return(AgentOutput{JSON: json.RawMessage(`{}`)}, nil)
+	}
 	h.env.OnActivity(h.a.Release, mock.Anything, mock.Anything).Return(ReleaseResult{EvidenceHash: "ev"}, nil)
 	h.env.OnActivity(h.a.RecordDecision, mock.Anything, mock.Anything).Return(nil)
 	h.env.OnActivity(h.a.Cleanup, mock.Anything, mock.Anything).Return(nil)
@@ -213,5 +218,63 @@ func TestTier2RunsOnlyAfterEarlierTiersPass(t *testing.T) {
 		if tiers[i] != want[i] {
 			t.Fatalf("tiers ran %v, want %v", tiers, want)
 		}
+	}
+}
+
+func TestAgentFailuresMapToStates(t *testing.T) {
+	cases := map[string]struct {
+		activity string
+		errType  string
+		want     Status
+	}{
+		"budget in developer": {"Develop", ErrBudget, BudgetExceeded},
+		"refusal in analyst":  {"Analyze", ErrAgentRefused, AgentRefused},
+		"plan needs human":    {"Architect", ErrNeedsHuman, EscalatedHuman},
+		"data filter tripped": {"Develop", ErrSensitiveData, BlockedSecurityVeto},
+		"killed mid-run":      {"Develop", ErrKilled, Killed},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, c.activity)
+			appErr := temporal.NewNonRetryableApplicationError("x", c.errType, nil)
+			switch c.activity {
+			case "Analyze":
+				h.env.OnActivity(h.a.Analyze, mock.Anything, mock.Anything).Return(AgentOutput{}, appErr)
+			case "Architect":
+				h.env.OnActivity(h.a.Architect, mock.Anything, mock.Anything).Return(AgentOutput{}, appErr)
+			case "Develop":
+				h.env.OnActivity(h.a.Develop, mock.Anything, mock.Anything).Return(DevelopResult{}, appErr)
+			}
+			h.evaluate(nil)
+			if out := h.run(t); out.Status != c.want {
+				t.Fatalf("status %s, want %s", out.Status, c.want)
+			}
+		})
+	}
+}
+
+func TestKillSwitchRefusesNewRun(t *testing.T) {
+	h := newHarness(t, "CreateRun")
+	h.env.OnActivity(h.a.CreateRun, mock.Anything, mock.Anything).Return(
+		temporal.NewNonRetryableApplicationError("kill switch is on", ErrKilled, nil))
+	if out := h.run(t); out.Status != Killed {
+		t.Fatalf("status %s", out.Status)
+	}
+}
+
+func TestProviderOutageIsRetried(t *testing.T) {
+	h := newHarness(t)
+	calls := 0
+	h.env.OnActivity(h.a.Develop, mock.Anything, mock.Anything).Return(func(context.Context, DevelopActivityInput) (DevelopResult, error) {
+		calls++
+		if calls < 3 {
+			return DevelopResult{}, errors.New("all model providers unavailable")
+		}
+		return DevelopResult{CommitSHA: "c1"}, nil
+	})
+	h.evaluate(nil)
+	h.approveAfter(time.Hour, true)
+	if out := h.run(t); out.Status != Approved || calls != 3 {
+		t.Fatalf("status %s after %d calls", out.Status, calls)
 	}
 }

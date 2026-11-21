@@ -1,0 +1,34 @@
+{
+  "request": null,
+  "response": {
+    "id": "msg_scripted",
+    "type": "message",
+    "role": "assistant",
+    "model": "scripted",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_scripted_008",
+        "name": "finish",
+        "input": {
+          "summary": "Settlement webhooks are now idempotent: each event_id is recorded in processed_events inside the crediting transaction, and duplicates are acknowledged without crediting again.",
+          "decisions": [
+            {
+              "decision": "INSERT OR IGNORE on a primary key, in the same transaction as the credit",
+              "reason": "the database guarantees one credit per event even under concurrent deliveries"
+            }
+          ]
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "inference_geo": "scripted"
+    }
+  }
+}

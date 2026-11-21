@@ -1,0 +1,30 @@
+{
+  "request": null,
+  "response": {
+    "id": "msg_scripted",
+    "type": "message",
+    "role": "assistant",
+    "model": "scripted",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_scripted_003",
+        "name": "read_file",
+        "input": {
+          "path": "tests/test_webhooks.py",
+          "start_line": 0,
+          "end_line": 0
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "inference_geo": "scripted"
+    }
+  }
+}

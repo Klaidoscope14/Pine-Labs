@@ -94,9 +94,11 @@ func (m Manager) EnsureMirror(ctx context.Context, remote string) (string, error
 		if _, err := m.git(ctx, m.MirrorsDir, "clone", "--bare", "--no-hardlinks", "--", remote, mirror); err != nil {
 			return "", err
 		}
-		return mirror, nil
 	}
-	_, err = m.git(ctx, mirror, "fetch", "--prune", "origin", "+refs/heads/*:refs/heads/*")
+	// Remote branches live under refs/remotes/origin/*, never refs/heads/*: run
+	// branches (agent/run-*) are local heads checked out by worktrees, and a
+	// pruning fetch into refs/heads would delete other runs' branches mid-run.
+	_, err = m.git(ctx, mirror, "fetch", "--prune", "origin", "+refs/heads/*:refs/remotes/origin/*")
 	return mirror, err
 }
 
@@ -105,7 +107,11 @@ func (m Manager) ResolveRef(ctx context.Context, mirror, ref string) (string, er
 	if strings.HasPrefix(ref, "-") {
 		return "", fmt.Errorf("invalid ref %q", ref)
 	}
-	out, err := m.git(ctx, mirror, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+	// Prefer the freshly fetched remote branch; fall back to the ref as given (a SHA).
+	out, err := m.git(ctx, mirror, "rev-parse", "--verify", "--quiet", "--end-of-options", "refs/remotes/origin/"+ref+"^{commit}")
+	if err != nil {
+		out, err = m.git(ctx, mirror, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
+	}
 	if err != nil {
 		return "", err
 	}
@@ -180,6 +186,33 @@ func (m Manager) ApplyOnto(ctx context.Context, wt Worktree, onto string, patch 
 	}
 	msg := message + "\n\nAegis-Key: " + key + "\n"
 	if _, err := m.git(ctx, wt.Path, "commit", "--no-verify", "--no-gpg-sign", "-q", "-m", msg); err != nil {
+		return "", err
+	}
+	return m.Head(ctx, wt)
+}
+
+// ResetClean discards any uncommitted changes, so an agent always starts from the
+// last committed state (e.g. after a crash mid-attempt).
+func (m Manager) ResetClean(ctx context.Context, wt Worktree) error {
+	if _, err := m.git(ctx, wt.Path, "reset", "--hard", "-q", "HEAD"); err != nil {
+		return err
+	}
+	_, err := m.git(ctx, wt.Path, "clean", "-fdq")
+	return err
+}
+
+// CommitWorking commits whatever the agent changed in the worktree. Like
+// ApplyOnto it is idempotent on key; an empty change is committed as empty so the
+// gates (not this function) decide what to do about it.
+func (m Manager) CommitWorking(ctx context.Context, wt Worktree, message, key string) (string, error) {
+	if sha, ok, err := m.findKey(ctx, wt, key); err != nil || ok {
+		return sha, err
+	}
+	if _, err := m.git(ctx, wt.Path, "add", "-A"); err != nil {
+		return "", err
+	}
+	msg := message + "\n\nAegis-Key: " + key + "\n"
+	if _, err := m.git(ctx, wt.Path, "commit", "--no-verify", "--no-gpg-sign", "--allow-empty", "-q", "-m", msg); err != nil {
 		return "", err
 	}
 	return m.Head(ctx, wt)

@@ -1,0 +1,24 @@
+{
+  "request": null,
+  "response": {
+    "id": "msg_scripted",
+    "type": "message",
+    "role": "assistant",
+    "model": "scripted",
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"impacted_modules\": [\"webhooks\", \"db\", \"ledger\"], \"design_summary\": \"Add a processed_events table keyed by event_id. In the webhook transaction, INSERT OR IGNORE the event_id and credit only when a row was inserted.\", \"interface_changes\": [], \"scope\": {\"planned\": [\"app/webhooks/handler.py\", \"app/db.py\"], \"adjacent\": [\"tests/**\"], \"protected_touched\": []}, \"planned_tests\": [\"tests/test_webhooks.py::test_duplicate_event_credits_once\"], \"diff_budget\": {\"files\": 4, \"lines\": 200}, \"decision_log\": [{\"decision\": \"Database uniqueness instead of an in-memory set\", \"reason\": \"Survives restarts and concurrent workers\", \"alternatives\": [\"in-process cache\"]}]}"
+      }
+    ],
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "inference_geo": "scripted"
+    }
+  }
+}

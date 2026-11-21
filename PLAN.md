@@ -579,9 +579,34 @@ Carried to Phase 3 as planned: selective tests, warm pool, offline OSV database,
 | 15–17 | `Develop`/`Release` activity changes, `aegis-run -mode llm` | Developer tool loop + Release summariser, prompts |
 | 17–18 | Live runs: record cassettes, 5-in-a-row, adversarial, kill switch | Same |
 
-#### Decisions needed from you before implementation
-1. **Which endpoint for development:** the first-party Claude API under a dev-only residency exception, or Bedrock with the India profile from day one (needs AWS credentials with Bedrock access in ap-south-1)?
-2. **Live-run budget:** live runs spend real money. Phase 2 needs about 10–20 live runs (cassette recording, 5-in-a-row, adversarial, kill test). I'll measure the cost of the first run and report it before continuing; please confirm a ceiling for `budget.per_run_usd` and the total.
+#### Decisions made
+1. **Endpoint: Amazon Bedrock, India profile, from day one.** Model: Claude Opus 5 (`in.anthropic.claude-opus-5`) for all four roles. No residency exception is needed.
+2. **Live-run budget:** still to confirm before `make phase2-live`. The first live run's cost gets measured and reported before continuing.
+
+#### Status: offline part done; live part waiting on AWS access
+`make phase2` passes with no model access:
+- **Exit criterion 1 (unit):** all passing. Covers router, data filter, gateway, residency routing check, config guards, ledger (kill-switch scopes, spend isolation) and the workflow's failure mappings.
+- **Exit criterion 2 (replay):** `live-happy` runs end to end through the real agents, router, gateway, contracts, gates and ledger on replayed responses, and ends APPROVED.
+- **Exit criterion 6 (data filter):** the ticket's card number appears in none of the 11 outgoing requests, and the ledger stores only the redacted ticket.
+- **No regressions:** the six Phase 1 stub scenarios still pass.
+
+**Waiting on live Bedrock access** (`make phase2-live`): criteria 3 (5 in a row), 4 (`live-protected`) and 5 (kill switch on a live run), plus criterion 7 against the real profile.
+
+Deviations and additions:
+- **The offline cassettes for `live-happy` are scripted, not recorded.** They are hand-written stand-ins, labelled as such. Live runs record real ones in the same format.
+- **The Architect works from a context pack** (file list + import graph + source files within `agents.max_context_bytes`) in one structured call, instead of a tool loop. That's enough for repositories this size; a read-only tool loop is the upgrade for large repositories.
+- **Configs can now `extends` another.** The merged result is validated, so an overlay can't skip guards.
+- **Account safety:** Bedrock uses only the `aws_profile` named in config. `default` is refused, and the worker won't start if environment AWS credentials are set (they would override the profile).
+- **Costs are recorded as unknown until `prices/bedrock-india.yaml` is filled in** from AWS pricing. Prices are never guessed. Until then, only the token budget is enforced.
+- **Two bugs found and fixed:**
+  - A pruning mirror fetch could delete concurrent runs' branches (a Phase 1 bug).
+  - The data filter misread JSON escapes as email addresses.
+
+**To run live:**
+1. Create an AWS profile named `aegis-bedrock` (or change `aws_profile` in `config.local.yaml`) for the account that should pay.
+2. Enable Claude model access in the India region.
+3. Fill in `prices/bedrock-india.yaml`.
+4. Run `make phase2-live`.
 
 ---
 

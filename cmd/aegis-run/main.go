@@ -13,7 +13,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -53,9 +55,17 @@ func main() {
 	root := cfg.Path(cfg.Evals.ScenariosDir)
 	names := []string{*name}
 	if *name == "all" {
-		if names, err = scenario.All(root); err != nil {
+		all, err := scenario.All(root)
+		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
+		}
+		// "all" means every scenario written for the configured agent mode.
+		names = nil
+		for _, n := range all {
+			if s, err := scenario.Load(root, n); err == nil && s.Agents == cfg.Agents.Mode {
+				names = append(names, n)
+			}
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
@@ -86,6 +96,10 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+		if s.Agents != cfg.Agents.Mode {
+			fmt.Fprintf(os.Stderr, "scenario %s is for %s agents, but this config runs %s agents\n", n, s.Agents, cfg.Agents.Mode)
+			os.Exit(1)
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -101,7 +115,7 @@ func main() {
 	}
 	sort.Slice(results, func(i, j int) bool { return results[i].scenario < results[j].scenario })
 	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "SCENARIO\tRUN\tSTATUS\tATTEMPTS\tRESULT")
+	fmt.Fprintln(tw, "SCENARIO\tRUN\tSTATUS\tATTEMPTS\tMODEL CALLS\tTOKENS (in/out/cached)\tCOST\tDENIED TOOL CALLS\tRESULT")
 	failed := false
 	for _, r := range results {
 		verdict := "ok"
@@ -109,7 +123,15 @@ func main() {
 			verdict = "FAIL: " + strings.Join(r.problems, "; ")
 			failed = true
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", r.scenario, r.runID, r.out.Status, r.out.Attempts, verdict)
+		u, _ := store.RunUsage(ctx, r.tenant, r.runID)
+		cost := "n/a"
+		if u.CostUSD != nil {
+			cost = fmt.Sprintf("$%.4f", *u.CostUSD)
+		} else if u.Calls > 0 {
+			cost = "unknown (no price table)"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d/%d/%d\t%s\t%d\t%s\n", r.scenario, r.runID, r.out.Status, r.out.Attempts,
+			u.Calls, u.InputTokens, u.OutputTokens, u.CacheRead, cost, u.DeniedToolCalls, verdict)
 	}
 	tw.Flush()
 	tenants := map[string]bool{}
@@ -145,13 +167,13 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 	}
 	repo := cfg.Repos[0].Name
 	if follow == "" {
-		requirement, err := s.Common(cfg.Path(cfg.Evals.ScenariosDir), "requirement.txt")
+		requirement, err := s.RequirementText(cfg.Path(cfg.Evals.ScenariosDir))
 		if err != nil {
 			return fail("read requirement: %v", err)
 		}
 		res.runID = newRunID(s.Name)
 		in := workflow.Input{RunID: res.runID, TenantID: s.Tenant, Repo: repo,
-			Requirement: strings.TrimSpace(string(requirement)), Scenario: s.Name,
+			Requirement: requirement, Scenario: s.Name,
 			ConfigHash: cfg.Hash, Settings: app.Settings(cfg)}
 		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: res.runID, TaskQueue: cfg.Temporal.TaskQueue},
 			app.WorkflowName, in); err != nil {
@@ -171,9 +193,13 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 		resp, err := c.QueryWorkflow(ctx, res.runID, "", workflow.QueryState)
 		var st workflow.State
 		if err == nil && resp.Get(&st) == nil {
-			if st.Status == workflow.AwaitingHuman && s.Approve && !signaled {
+			if st.Status == workflow.AwaitingHuman && !signaled {
+				note := "scenario auto-approval"
+				if !s.Approve {
+					note = "scenario auto-rejection"
+				}
 				if err := c.SignalWorkflow(ctx, res.runID, "", workflow.SignalDecision,
-					workflow.Decision{Approve: true, Reviewer: reviewer, Note: "scenario auto-approval"}); err != nil {
+					workflow.Decision{Approve: s.Approve, Reviewer: reviewer, Note: note}); err != nil {
 					return fail("signal: %v", err)
 				}
 				signaled = true
@@ -192,8 +218,11 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 	if err := c.GetWorkflow(ctx, res.runID, "").Get(ctx, &res.out); err != nil {
 		return fail("run failed: %v", err)
 	}
-	if string(res.out.Status) != s.Expect.Status {
+	if s.Expect.Status != "" && string(res.out.Status) != s.Expect.Status {
 		fail("status %s, expected %s (%s)", res.out.Status, s.Expect.Status, res.out.Reason)
+	}
+	if len(s.Expect.StatusIn) > 0 && !slices.Contains(s.Expect.StatusIn, string(res.out.Status)) {
+		fail("status %s, expected one of %v (%s)", res.out.Status, s.Expect.StatusIn, res.out.Reason)
 	}
 	if s.Expect.Attempts > 0 && res.out.Attempts != s.Expect.Attempts {
 		fail("attempts %d, expected %d", res.out.Attempts, s.Expect.Attempts)
@@ -207,6 +236,20 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 	}
 	if s.Expect.ResolvedRule != "" && !resolved(sum, s.Expect.ResolvedRule) {
 		fail("finding %s was not marked RESOLVED", s.Expect.ResolvedRule)
+	}
+	if len(s.Expect.Untouched) > 0 && sum.Run.HeadSHA != "" {
+		r, _ := cfg.Repo(repo)
+		remote, _ := cfg.RepoRemote(r)
+		mirror := app.Workspace(cfg).MirrorPath(remote)
+		out, err := exec.Command("git", "-C", mirror, "diff", "--name-only", sum.Run.BaseSHA, sum.Run.HeadSHA, "--").Output()
+		if err != nil {
+			fail("diff for untouched check: %v", err)
+		}
+		for _, f := range strings.Fields(string(out)) {
+			if slices.Contains(s.Expect.Untouched, f) {
+				fail("%s was modified", f)
+			}
+		}
 	}
 	return res
 }

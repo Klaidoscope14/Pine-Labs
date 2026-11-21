@@ -1,0 +1,8 @@
+# Real agents on Claude via Amazon Bedrock (India geographic inference profile).
+# Credentials come only from the AWS profile named in aws_profile (config.local.yaml).
+# Responses are recorded under evals/cassettes so they can be replayed offline.
+extends: config.local.yaml
+agents:
+  mode: llm
+llm:
+  fallback_order: [bedrock-india]

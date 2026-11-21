@@ -13,7 +13,6 @@ import (
 	"go.temporal.io/sdk/worker"
 	tworkflow "go.temporal.io/sdk/workflow"
 
-	"aegis/internal/agents/stub"
 	"aegis/internal/app"
 	"aegis/internal/config"
 	"aegis/internal/sandbox"
@@ -54,17 +53,23 @@ func main() {
 	} else if n > 0 {
 		log.Info("removed orphaned sandbox containers", "count", n)
 	}
+	ag, err := app.Agents(ctx, cfg, store, docker)
+	if err != nil {
+		log.Error("agents", "error", err.Error())
+		os.Exit(1)
+	}
 	acts := &workflow.Activities{
 		Cfg: cfg, Store: store, WS: app.Workspace(cfg), Image: cfg.Sandbox.Image,
 		Sandbox: docker,
-		Agents:  stub.Agents{Root: cfg.Path(cfg.Evals.ScenariosDir)}, // Phase 2: LLM agents
+		Agents:  ag,
 	}
 	w := worker.New(c, cfg.Temporal.TaskQueue, worker.Options{
 		MaxConcurrentActivityExecutionSize: cfg.Temporal.MaxConcurrentActivities,
 	})
 	w.RegisterWorkflowWithOptions(workflow.Run, tworkflow.RegisterOptions{Name: app.WorkflowName})
 	w.RegisterActivity(acts)
-	log.Info("worker started", "task_queue", cfg.Temporal.TaskQueue, "config_hash", cfg.Hash)
+	log.Info("worker started", "task_queue", cfg.Temporal.TaskQueue, "config_hash", cfg.Hash,
+		"agents", cfg.Agents.Mode, "providers", cfg.LLM.FallbackOrder)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Error("worker stopped", "error", err.Error())
 		os.Exit(1)

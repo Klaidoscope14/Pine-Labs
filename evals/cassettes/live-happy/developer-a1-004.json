@@ -1,0 +1,30 @@
+{
+  "request": null,
+  "response": {
+    "id": "msg_scripted",
+    "type": "message",
+    "role": "assistant",
+    "model": "scripted",
+    "content": [
+      {
+        "type": "tool_use",
+        "id": "toolu_scripted_005",
+        "name": "edit_file",
+        "input": {
+          "path": "app/webhooks/handler.py",
+          "old_text": "    with db.transaction() as conn:\n        store.credit(conn, event.merchant_id, event.amount_paise, reference=event.event_id)\n    return {\"status\": \"credited\"}",
+          "new_text": "    with db.transaction() as conn:\n        # The bank retries deliveries: record each event_id once, credit only on first sight.\n        inserted = conn.execute(\n            \"INSERT OR IGNORE INTO processed_events (event_id) VALUES (?)\", (event.event_id,)\n        ).rowcount\n        if inserted == 0:\n            return {\"status\": \"duplicate\"}\n        store.credit(conn, event.merchant_id, event.amount_paise, reference=event.event_id)\n    return {\"status\": \"credited\"}"
+        }
+      }
+    ],
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "usage": {
+      "input_tokens": 1200,
+      "output_tokens": 300,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 0,
+      "inference_geo": "scripted"
+    }
+  }
+}

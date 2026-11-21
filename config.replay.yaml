@@ -1,0 +1,4 @@
+# Real agents, replayed model responses: no network, no cost, deterministic.
+extends: config.local.yaml
+agents:
+  mode: llm

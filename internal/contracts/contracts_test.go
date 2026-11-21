@@ -1,8 +1,10 @@
 package contracts
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"aegis/schemas"
@@ -39,5 +41,23 @@ func TestMalformedOutputsAreRejected(t *testing.T) {
 				t.Error("malformed output was accepted")
 			}
 		})
+	}
+}
+
+func TestModelSchemasAreSimplifiedAndClosed(t *testing.T) {
+	for name := range schemas.AgentSchemas {
+		s, err := ModelSchema(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(s)
+		for _, kw := range []string{`"pattern"`, `"minItems"`, `"$schema"`, `"allOf"`} {
+			if strings.Contains(string(raw), kw) {
+				t.Errorf("%s still has %s", name, kw)
+			}
+		}
+		if s["additionalProperties"] != false {
+			t.Errorf("%s is not closed", name)
+		}
 	}
 }

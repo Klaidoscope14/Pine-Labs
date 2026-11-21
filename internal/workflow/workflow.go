@@ -37,6 +37,8 @@ const (
 	EscalatedHuman       Status = "ESCALATED_HUMAN"
 	FailedSchema         Status = "FAILED_SCHEMA"
 	Killed               Status = "KILLED"
+	BudgetExceeded       Status = "BUDGET_EXCEEDED"
+	AgentRefused         Status = "AGENT_REFUSED"
 )
 
 // Settings is the config snapshot a run executes under. Passed in at start, so a
@@ -115,7 +117,7 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			BackoffCoefficient:     2,
 			MaximumInterval:        30 * time.Second,
 			MaximumAttempts:        5,
-			NonRetryableErrorTypes: []string{ErrContract, ErrScenario},
+			NonRetryableErrorTypes: []string{ErrContract, ErrScenario, ErrAgentRefused, ErrBudget, ErrKilled, ErrSensitiveData, ErrNeedsHuman},
 		},
 	})
 
@@ -148,13 +150,43 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 		cleanup()
 		return out, nil
 	}
-	contractFailure := func(err error) bool {
+	// terminal maps a typed agent failure to the state the run ends in.
+	terminal := func(err error) (Status, bool) {
 		var appErr *temporal.ApplicationError
-		return errors.As(err, &appErr) && appErr.Type() == ErrContract
+		if !errors.As(err, &appErr) {
+			return "", false
+		}
+		switch appErr.Type() {
+		case ErrContract:
+			return FailedSchema, true
+		case ErrAgentRefused:
+			return AgentRefused, true
+		case ErrBudget:
+			return BudgetExceeded, true
+		case ErrKilled:
+			return Killed, true
+		case ErrSensitiveData:
+			return BlockedSecurityVeto, true
+		case ErrNeedsHuman:
+			return EscalatedHuman, true
+		}
+		return "", false
+	}
+	contractFailure := func(err error) bool { _, ok := terminal(err); return ok }
+	reasonOf := func(err error) string {
+		var appErr *temporal.ApplicationError
+		if errors.As(err, &appErr) {
+			return appErr.Message()
+		}
+		return err.Error()
 	}
 	canceled := func(err error) bool { return temporal.IsCanceledError(err) || ctx.Err() != nil }
 
 	if err := workflow.ExecuteActivity(actx, a.CreateRun, in).Get(actx, nil); err != nil {
+		if st, ok := terminal(err); ok {
+			out.Status, out.Reason = st, reasonOf(err)
+			return out, nil // refused before the run existed; nothing to record or clean up
+		}
 		return out, err
 	}
 
@@ -175,7 +207,8 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 	var spec AgentOutput
 	if err := workflow.ExecuteActivity(actx, a.Analyze, AgentInput{Run: in, Workspace: ws}).Get(actx, &spec); err != nil {
 		if contractFailure(err) {
-			return finish(FailedSchema, "analyst output failed its contract")
+			st, _ := terminal(err)
+			return finish(st, reasonOf(err))
 		}
 		if canceled(err) {
 			return finish(Killed, "run was stopped")
@@ -189,7 +222,8 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 	var plan AgentOutput
 	if err := workflow.ExecuteActivity(actx, a.Architect, AgentInput{Run: in, Workspace: ws, Prior: spec.JSON}).Get(actx, &plan); err != nil {
 		if contractFailure(err) {
-			return finish(FailedSchema, "architect output failed its contract")
+			st, _ := terminal(err)
+			return finish(st, reasonOf(err))
 		}
 		if canceled(err) {
 			return finish(Killed, "run was stopped")
@@ -205,11 +239,12 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			return out, err
 		}
 		var dev DevelopResult
-		err := workflow.ExecuteActivity(actx, a.Develop, DevelopActivityInput{Run: in, Workspace: ws, Plan: plan.JSON,
+		err := workflow.ExecuteActivity(actx, a.Develop, DevelopActivityInput{Run: in, Workspace: ws, Spec: spec.JSON, Plan: plan.JSON,
 			Attempt: attempt, Diagnostics: diagnostics}).Get(actx, &dev)
 		if err != nil {
 			if contractFailure(err) {
-				return finish(FailedSchema, "developer output failed its contract")
+				st, _ := terminal(err)
+				return finish(st, reasonOf(err))
 			}
 			if canceled(err) {
 				return finish(Killed, "run was stopped")
@@ -269,7 +304,8 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 	if err := workflow.ExecuteActivity(actx, a.Release, ReleaseInput{Run: in, Workspace: ws, Spec: spec.JSON,
 		Plan: plan.JSON, HeadSHA: out.HeadSHA, Attempts: out.Attempts}).Get(actx, &pkt); err != nil {
 		if contractFailure(err) {
-			return finish(FailedSchema, "release packet failed its contract")
+			st, _ := terminal(err)
+			return finish(st, reasonOf(err))
 		}
 		return out, err
 	}

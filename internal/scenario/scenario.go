@@ -13,16 +13,24 @@ import (
 
 // Scenario is one evals/scenarios/<name>/scenario.yaml.
 type Scenario struct {
-	Name            string   `yaml:"name"`
-	Description     string   `yaml:"description"`
-	Tenant          string   `yaml:"tenant"`
+	Name        string `yaml:"name"`
+	Description string `yaml:"description"`
+	Tenant      string `yaml:"tenant"`
+	// Agents is "stub" (default: replays patches) or "llm" (real or replayed model calls).
+	Agents string `yaml:"agents"`
+	// Requirement overrides _common/requirement.txt.
+	Requirement     string   `yaml:"requirement"`
 	Attempts        []string `yaml:"attempts"`
 	DeveloperResult string   `yaml:"developer_result"`
 	Approve         bool     `yaml:"approve"`
 	Expect          struct {
-		Status       string `yaml:"status"`
-		Attempts     int    `yaml:"attempts"`
-		ResolvedRule string `yaml:"resolved_rule"`
+		Status string `yaml:"status"`
+		// StatusIn accepts any of several end states (for real-agent scenarios).
+		StatusIn []string `yaml:"status_in"`
+		// Untouched lists paths that must be identical at base and head.
+		Untouched    []string `yaml:"untouched"`
+		Attempts     int      `yaml:"attempts"`
+		ResolvedRule string   `yaml:"resolved_rule"`
 	} `yaml:"expect"`
 
 	Dir string `yaml:"-"`
@@ -49,7 +57,10 @@ func Load(root, name string) (Scenario, error) {
 	if s.Name != name {
 		return Scenario{}, fmt.Errorf("scenario %s: name field is %q", name, s.Name)
 	}
-	if len(s.Attempts) == 0 && s.DeveloperResult == "" {
+	if s.Agents == "" {
+		s.Agents = "stub"
+	}
+	if s.Agents == "stub" && len(s.Attempts) == 0 && s.DeveloperResult == "" {
 		return Scenario{}, fmt.Errorf("scenario %s: needs attempts or developer_result", name)
 	}
 	s.Dir = dir
@@ -69,6 +80,15 @@ func All(root string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// RequirementText returns the scenario's requirement.
+func (s Scenario) RequirementText(root string) (string, error) {
+	if strings.TrimSpace(s.Requirement) != "" {
+		return strings.TrimSpace(s.Requirement), nil
+	}
+	b, err := s.Common(root, "requirement.txt")
+	return strings.TrimSpace(string(b)), err
 }
 
 // Common reads a shared file from <root>/_common, overridden by the scenario's own copy.

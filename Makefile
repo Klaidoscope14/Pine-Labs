@@ -103,3 +103,17 @@ crash-test: build ## Kill the worker mid-run; the run must finish with no duplic
 
 ledger-verify: build ## Verify every tenant's audit chain
 	$(SECRETS_ENV) bin/aegis-ledger -config $(CONFIG) verify
+
+# ---------------- Phase 2 ----------------
+.PHONY: phase2 phase2-offline phase2-live cassettes
+
+phase2: test ledger-test migrate seed-repo phase2-offline run-all ledger-verify ## Phase 2 checks that need no model access
+
+cassettes: ## Regenerate the scripted offline cassettes for live-happy
+	python3 scripts/make-scripted-cassettes.py .
+
+phase2-offline: build ## Real agents on replayed responses; card number must never leave the machine
+	@$(SECRETS_ENV) scripts/phase2-offline.sh $(LOGS)
+
+phase2-live: build ## SPENDS MONEY: Bedrock India runs (5 in a row, protected file, kill switch)
+	@$(SECRETS_ENV) scripts/phase2-live.sh $(LOGS) $(or $(RUNS),5)

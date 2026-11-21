@@ -18,11 +18,14 @@ import (
 	"go.temporal.io/sdk/temporal"
 
 	"aegis/internal/agents"
+	"aegis/internal/agents/llmagents"
 	"aegis/internal/config"
 	"aegis/internal/contracts"
+	"aegis/internal/dlp"
 	"aegis/internal/gaterun"
 	"aegis/internal/gates"
 	"aegis/internal/ledger"
+	"aegis/internal/llm"
 	"aegis/internal/sandbox"
 	"aegis/internal/workspace"
 )
@@ -76,6 +79,7 @@ type AgentOutput struct {
 type DevelopActivityInput struct {
 	Run         Input           `json:"run"`
 	Workspace   WorkspaceInfo   `json:"workspace"`
+	Spec        json.RawMessage `json:"spec"`
 	Plan        json.RawMessage `json:"plan"`
 	Attempt     int             `json:"attempt"`
 	Diagnostics string          `json:"diagnostics"`
@@ -135,6 +139,47 @@ type DecisionInput struct {
 
 // ---- helpers ----
 
+// Application error types the workflow maps to terminal states.
+const (
+	ErrAgentRefused  = "AgentRefused"
+	ErrBudget        = "BudgetExceeded"
+	ErrKilled        = "Killed"
+	ErrSensitiveData = "SensitiveData"
+	ErrNeedsHuman    = "NeedsHuman"
+)
+
+// agentError turns an agent failure into the right Temporal error: terminal
+// conditions become non-retryable typed errors; provider outages stay retryable.
+func agentError(role string, err error) error {
+	nr := func(kind string) error {
+		return temporal.NewNonRetryableApplicationError(role+": "+err.Error(), kind, err)
+	}
+	switch {
+	case errors.Is(err, llmagents.ErrContract):
+		return nr(ErrContract)
+	case errors.Is(err, llm.ErrRefused):
+		return nr(ErrAgentRefused)
+	case errors.Is(err, llm.ErrBudget):
+		return nr(ErrBudget)
+	case errors.Is(err, llm.ErrKilled):
+		return nr(ErrKilled)
+	case errors.Is(err, llm.ErrSensitiveData):
+		return nr(ErrSensitiveData)
+	case errors.Is(err, llm.ErrNoCassette):
+		return nr(ErrScenario)
+	case errors.Is(err, agents.ErrNeedsHuman):
+		return nr(ErrNeedsHuman)
+	case errors.Is(err, llm.ErrUnavailable):
+		return err // retried by Temporal with backoff
+	default:
+		return nr(ErrScenario)
+	}
+}
+
+func (a *Activities) agentRun(in Input, attempt int) agents.Run {
+	return agents.Run{TenantID: in.TenantID, RunID: in.RunID, Scenario: in.Scenario, Repo: in.Repo, Attempt: attempt}
+}
+
 func contractError(name string, err error) error {
 	return temporal.NewNonRetryableApplicationError(fmt.Sprintf("%s failed its contract: %v", name, err), ErrContract, err)
 }
@@ -193,8 +238,15 @@ func keepAlive(ctx context.Context) func() {
 
 func (a *Activities) CreateRun(ctx context.Context, in Input) error {
 	defer keepAlive(ctx)()
+	if on, reason, err := a.Store.KillActive(ctx, in.TenantID); err != nil {
+		return err
+	} else if on {
+		return temporal.NewNonRetryableApplicationError("kill switch is on: "+reason, ErrKilled, nil)
+	}
+	// Tickets can contain card numbers or personal data; the ledger only ever keeps the redacted text.
+	requirement, _ := dlp.Redact(in.Requirement)
 	return a.Store.CreateRun(ctx, ledger.Run{RunID: in.RunID, TenantID: in.TenantID, Scenario: in.Scenario,
-		Repo: in.Repo, Requirement: in.Requirement, Status: string(Queued), ConfigHash: in.ConfigHash})
+		Repo: in.Repo, Requirement: requirement, Status: string(Queued), ConfigHash: in.ConfigHash})
 }
 
 func (a *Activities) RecordTransition(ctx context.Context, t TransitionInput) error {
@@ -246,9 +298,10 @@ func (a *Activities) Prepare(ctx context.Context, in Input) (WorkspaceInfo, erro
 
 func (a *Activities) Analyze(ctx context.Context, in AgentInput) (AgentOutput, error) {
 	defer keepAlive(ctx)()
-	out, err := a.Agents.Analyze(ctx, agents.AnalyzeInput{RunID: in.Run.RunID, Scenario: in.Run.Scenario, Requirement: in.Run.Requirement})
+	out, err := a.Agents.Analyze(ctx, agents.AnalyzeInput{Run: a.agentRun(in.Run, 0), Requirement: in.Run.Requirement,
+		Worktree: in.Workspace.Path})
 	if err != nil {
-		return AgentOutput{}, temporal.NewNonRetryableApplicationError(err.Error(), ErrScenario, err)
+		return AgentOutput{}, agentError("analyst", err)
 	}
 	if err := contracts.Validate("requirement_spec", out); err != nil {
 		return AgentOutput{}, contractError("requirement_spec", err)
@@ -258,10 +311,14 @@ func (a *Activities) Analyze(ctx context.Context, in AgentInput) (AgentOutput, e
 
 func (a *Activities) Architect(ctx context.Context, in AgentInput) (AgentOutput, error) {
 	defer keepAlive(ctx)()
-	out, err := a.Agents.Architect(ctx, agents.ArchitectInput{RunID: in.Run.RunID, Scenario: in.Run.Scenario,
+	out, err := a.Agents.Architect(ctx, agents.ArchitectInput{Run: a.agentRun(in.Run, 0),
 		RequirementSpec: in.Prior, Worktree: in.Workspace.Path})
 	if err != nil {
-		return AgentOutput{}, temporal.NewNonRetryableApplicationError(err.Error(), ErrScenario, err)
+		if errors.Is(err, agents.ErrNeedsHuman) && out != nil {
+			// Keep the plan as evidence for the human design decision.
+			_ = writeJSON(filepath.Join(a.runDir(in.Run.RunID), "architecture_plan.json"), json.RawMessage(out))
+		}
+		return AgentOutput{}, agentError("architect", err)
 	}
 	if err := contracts.Validate("architecture_plan", out); err != nil {
 		return AgentOutput{}, contractError("architecture_plan", err)
@@ -273,10 +330,17 @@ func (a *Activities) Develop(ctx context.Context, in DevelopActivityInput) (Deve
 	defer keepAlive(ctx)()
 	key := fmt.Sprintf("%s:develop:%d", in.Run.RunID, in.Attempt)
 	raw, err := a.Store.Once(ctx, in.Run.TenantID, in.Run.RunID, key, func() (json.RawMessage, error) {
-		out, err := a.Agents.Develop(ctx, agents.DevelopInput{RunID: in.Run.RunID, Scenario: in.Run.Scenario,
-			Attempt: in.Attempt, Plan: in.Plan, Worktree: in.Workspace.Path, Diagnostics: in.Diagnostics})
+		wt := in.Workspace.worktree()
+		// Agents always start from the last committed state (attempt 1: the base;
+		// later attempts: the previous attempt's commit). Partial edits from a
+		// crashed execution are discarded.
+		if err := a.WS.ResetClean(ctx, wt); err != nil {
+			return nil, err
+		}
+		out, err := a.Agents.Develop(ctx, agents.DevelopInput{Run: a.agentRun(in.Run, in.Attempt),
+			RequirementSpec: in.Spec, Plan: in.Plan, Worktree: in.Workspace.Path, Diagnostics: in.Diagnostics})
 		if err != nil {
-			return nil, temporal.NewNonRetryableApplicationError(err.Error(), ErrScenario, err)
+			return nil, agentError("developer", err)
 		}
 		if out.Conflict != nil {
 			if err := contracts.Validate("developer_result", out.Conflict); err != nil {
@@ -290,11 +354,19 @@ func (a *Activities) Develop(ctx context.Context, in DevelopActivityInput) (Deve
 			_ = json.Unmarshal(out.Conflict, &c)
 			return json.Marshal(DevelopResult{Conflict: true, ConflictReason: c.Conflict.Reason})
 		}
-		// Each attempt is a fresh proposal against the pinned base.
-		sha, err := a.WS.ApplyOnto(ctx, in.Workspace.worktree(), in.Workspace.BaseSHA, out.Patch,
-			fmt.Sprintf("aegis: run %s attempt %d", in.Run.RunID, in.Attempt), key)
-		if err != nil {
-			return nil, temporal.NewNonRetryableApplicationError("patch did not apply: "+err.Error(), ErrScenario, err)
+		msg := fmt.Sprintf("aegis: run %s attempt %d", in.Run.RunID, in.Attempt)
+		var sha string
+		if out.EditedInPlace {
+			sha, err = a.WS.CommitWorking(ctx, wt, msg, key)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			// Stub patches are full proposals against the pinned base.
+			sha, err = a.WS.ApplyOnto(ctx, wt, in.Workspace.BaseSHA, out.Patch, msg, key)
+			if err != nil {
+				return nil, temporal.NewNonRetryableApplicationError("patch did not apply: "+err.Error(), ErrScenario, err)
+			}
 		}
 		changes, err := a.WS.Diff(ctx, in.Workspace.worktree(), in.Workspace.BaseSHA, sha)
 		if err != nil {
@@ -512,9 +584,36 @@ func (a *Activities) Release(ctx context.Context, in ReleaseInput) (ReleaseResul
 	if len(title) > 110 {
 		title = title[:107] + "..."
 	}
+	summary, risks := spec.Summary, spec.Risks
+	if sz, ok := a.Agents.(agents.Summarizer); ok && a.Cfg.Agents.Mode == "llm" {
+		var gateLines []string
+		_ = filepath.WalkDir(attemptDir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && filepath.Base(p) == "outcome.json" {
+				var o gaterun.Outcome
+				if data, err := os.ReadFile(p); err == nil && json.Unmarshal(data, &o) == nil {
+					for _, r := range o.Results {
+						gateLines = append(gateLines, fmt.Sprintf("%s: %s (%s)", r.Gate, r.Verdict, r.Summary))
+					}
+				}
+			}
+			return nil
+		})
+		sort.Strings(gateLines)
+		changes, _ := a.WS.Diff(ctx, wt, wt.BaseSHA, in.HeadSHA)
+		var stat []string
+		for _, c := range changes {
+			stat = append(stat, fmt.Sprintf("%s %s +%d -%d", c.Status, c.Path, c.Added, c.Deleted))
+		}
+		s, r, err := sz.Summarize(ctx, agents.SummaryInput{Run: a.agentRun(in.Run, in.Attempts),
+			RequirementSpec: in.Spec, Plan: in.Plan, GateSummaries: gateLines, DiffStat: strings.Join(stat, "\n")})
+		if err != nil {
+			return ReleaseResult{}, agentError("release", err)
+		}
+		summary, risks = s, append(append([]string{}, spec.Risks...), r...)
+	}
 	packet := map[string]any{
-		"pr_title": title, "summary": spec.Summary, "base_sha": wt.BaseSHA, "head_sha": in.HeadSHA,
-		"evidence_hash": evidence, "risks": spec.Risks,
+		"pr_title": title, "summary": summary, "base_sha": wt.BaseSHA, "head_sha": in.HeadSHA,
+		"evidence_hash": evidence, "risks": risks,
 		"rollout": map[string]string{"flag": "aegis_" + strings.ReplaceAll(in.Run.RunID, "-", "_"),
 			"canary": "enable for one tenant first", "rollback": "disable the flag; revert the branch"},
 		"scorecard": map[string]int{"must_passed": must, "must_total": must, "should_passed": 0, "should_total": 0},

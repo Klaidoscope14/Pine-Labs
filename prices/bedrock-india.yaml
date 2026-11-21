@@ -1,0 +1,10 @@
+# USD per million tokens for Claude on Amazon Bedrock, India geographic profile.
+# Fill these from the AWS Bedrock pricing page for your account and region.
+# Until a model is listed here, its cost is recorded as "unknown" (never guessed)
+# and only the token budget is enforced.
+models: {}
+#  in.anthropic.claude-opus-5:
+#    input_per_mtok: <from AWS pricing>
+#    output_per_mtok: <from AWS pricing>
+#    cache_read_per_mtok: <from AWS pricing>
+#    cache_write_per_mtok: <from AWS pricing>

@@ -2,6 +2,7 @@ package config
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -40,16 +41,18 @@ func TestConfigHashIsStable(t *testing.T) {
 // Each bad fixture must be rejected, and the error must mention why.
 func TestBadConfigsAreRejected(t *testing.T) {
 	want := map[string]string{
-		"bad-jurisdiction.yaml":       "not in data_residency.allowed_jurisdictions",
-		"bad-untagged.yaml":           "jurisdiction",
-		"bad-plaintext-secret.yaml":   "api_key_ref",
-		"bad-same-region.yaml":        "dr_region must differ",
-		"bad-sandbox-network.yaml":    "network",
-		"bad-llm-endpoint-kind.yaml":  "want llm",
-		"bad-unknown-fallback.yaml":   "unknown provider",
-		"bad-unknown-key.yaml":        "surprise_key",
-		"bad-tier-not-enabled.yaml":   "not in gates.enabled",
-		"bad-repo-endpoint-kind.yaml": "want code_host",
+		"bad-jurisdiction.yaml":            "not in data_residency.allowed_jurisdictions",
+		"bad-untagged.yaml":                "jurisdiction",
+		"bad-plaintext-secret.yaml":        "api_key_ref",
+		"bad-same-region.yaml":             "dr_region must differ",
+		"bad-sandbox-network.yaml":         "network",
+		"bad-llm-endpoint-kind.yaml":       "want llm",
+		"bad-unknown-fallback.yaml":        "unknown provider",
+		"bad-unknown-key.yaml":             "surprise_key",
+		"bad-tier-not-enabled.yaml":        "not in gates.enabled",
+		"bad-repo-endpoint-kind.yaml":      "want code_host",
+		"bad-replay-no-cassettes.yaml":     "needs cassette_dir",
+		"bad-bedrock-default-profile.yaml": "explicit aws_profile",
 	}
 	files, err := filepath.Glob("testdata/bad-*.yaml")
 	if err != nil {
@@ -115,5 +118,31 @@ func TestRepoRemoteResolvesFileURL(t *testing.T) {
 	}
 	if !filepath.IsAbs(remote) || !strings.HasSuffix(remote, ".data/git/pine-settlements-svc.git") {
 		t.Errorf("unexpected remote %q", remote)
+	}
+}
+
+func TestExtendsMergesAndValidates(t *testing.T) {
+	dir := t.TempDir()
+	base, _ := os.ReadFile("testdata/good.yaml")
+	if err := os.WriteFile(filepath.Join(dir, "base.yaml"), base, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	overlay := "extends: base.yaml\nagents:\n  mode: llm\n"
+	if err := os.WriteFile(filepath.Join(dir, "over.yaml"), []byte(overlay), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFile(filepath.Join(dir, "over.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Agents.Mode != "llm" || cfg.Agents.MaxToolCalls != 40 {
+		t.Errorf("merge lost values: %+v", cfg.Agents)
+	}
+	bad := "extends: base.yaml\nsandbox:\n  network: bridge\n"
+	if err := os.WriteFile(filepath.Join(dir, "bad.yaml"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadFile(filepath.Join(dir, "bad.yaml")); err == nil {
+		t.Error("overlay bypassed the guards")
 	}
 }
