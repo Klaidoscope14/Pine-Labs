@@ -123,6 +123,43 @@
           "items": {
             "$ref": "#/$defs/jurisdiction"
           }
+        },
+        "exceptions": {
+          "type": "array",
+          "description": "Dev-only, expiring permission for a named endpoint outside allowed_jurisdictions. Refused in production.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "endpoint",
+              "reason",
+              "expires",
+              "environments"
+            ],
+            "properties": {
+              "endpoint": {
+                "$ref": "#/$defs/name"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 10
+              },
+              "expires": {
+                "type": "string",
+                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+              },
+              "environments": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "enum": [
+                    "local",
+                    "staging"
+                  ]
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -240,7 +277,8 @@
                 "enum": [
                   "anthropic",
                   "bedrock",
-                  "replay"
+                  "replay",
+                  "openai_compat"
                 ]
               },
               "region": {

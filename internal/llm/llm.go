@@ -136,6 +136,10 @@ func retryable(err error) bool {
 	if errors.As(err, &apierr) {
 		return apierr.StatusCode == 408 || apierr.StatusCode == 409 || apierr.StatusCode == 429 || apierr.StatusCode >= 500
 	}
+	var herr *HTTPError
+	if errors.As(err, &herr) {
+		return herr.StatusCode == 408 || herr.StatusCode == 409 || herr.StatusCode == 429 || herr.StatusCode >= 500
+	}
 	var nerr net.Error
 	return errors.As(err, &nerr) || errors.Is(err, context.DeadlineExceeded)
 }
@@ -243,6 +247,21 @@ func scanRequest(params anthropic.MessageNewParams) (dlp.Finding, error) {
 		return nil, err
 	}
 	total := dlp.Finding{}
+	// The model's own earlier turns are not scanned: echoing what the provider
+	// generated back to the same provider discloses nothing new. Everything we
+	// send (system prompt, ticket, repo files, tool output) is scanned.
+	if m, ok := doc.(map[string]any); ok {
+		if msgs, ok := m["messages"].([]any); ok {
+			kept := msgs[:0]
+			for _, msg := range msgs {
+				if mm, ok := msg.(map[string]any); ok && mm["role"] == "assistant" {
+					continue
+				}
+				kept = append(kept, msg)
+			}
+			m["messages"] = kept
+		}
+	}
 	var walk func(v any)
 	walk = func(v any) {
 		switch x := v.(type) {

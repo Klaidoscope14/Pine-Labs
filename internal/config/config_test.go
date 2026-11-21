@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestGoodConfigLoads(t *testing.T) {
@@ -144,5 +145,57 @@ func TestExtendsMergesAndValidates(t *testing.T) {
 	}
 	if _, err := LoadFile(filepath.Join(dir, "bad.yaml")); err == nil {
 		t.Error("overlay bypassed the guards")
+	}
+}
+
+func withNow(t *testing.T, day string) {
+	t.Helper()
+	d, _ := time.Parse("2006-01-02", day)
+	old := now
+	now = func() time.Time { return d }
+	t.Cleanup(func() { now = old })
+}
+
+func TestResidencyExceptions(t *testing.T) {
+	base, _ := os.ReadFile("testdata/good.yaml")
+	load := func(mutate func(string) string) error {
+		p := filepath.Join(t.TempDir(), "c.yaml")
+		os.WriteFile(p, []byte(mutate(string(base))), 0o644)
+		_, err := LoadFile(p)
+		return err
+	}
+	same := func(s string) string { return s }
+	withNow(t, "2026-11-21")
+	if err := load(same); err != nil {
+		t.Fatalf("valid exception rejected: %v", err)
+	}
+	cases := map[string]struct {
+		mutate func(string) string
+		want   string
+	}{
+		"production": {func(s string) string {
+			return strings.Replace(s, "environment: local", "environment: production", 1)
+		}, "not allowed in production"},
+		"no exception": {func(s string) string {
+			return strings.Replace(s, "endpoint: llm-deploy-sf\n", "endpoint: llm-fake\n", 1)
+		}, "llm-deploy-sf"},
+		"too far ahead": {func(s string) string {
+			return strings.Replace(s, `expires: "2026-12-31"`, `expires: "2027-06-30"`, 1)
+		}, "more than 90 days"},
+		"unknown endpoint": {func(s string) string {
+			return strings.Replace(s, "      environments: [local]", "      environments: [local]\n    - endpoint: ghost\n      reason: nothing to see here at all\n      expires: \"2026-12-01\"\n      environments: [local]", 1)
+		}, "unknown endpoint"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := load(c.mutate)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("got %v, want error mentioning %q", err, c.want)
+			}
+		})
+	}
+	withNow(t, "2027-01-05")
+	if err := load(same); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired exception accepted: %v", err)
 	}
 }

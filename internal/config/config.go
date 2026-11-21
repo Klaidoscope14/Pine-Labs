@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"gopkg.in/yaml.v3"
@@ -65,8 +66,24 @@ type Deployment struct {
 }
 
 type DataResidency struct {
-	AllowedJurisdictions []string `json:"allowed_jurisdictions"`
+	AllowedJurisdictions []string             `json:"allowed_jurisdictions"`
+	Exceptions           []ResidencyException `json:"exceptions,omitempty"`
 }
+
+// ResidencyException lets one named endpoint sit outside the allowed
+// jurisdictions for development only, until an expiry date.
+type ResidencyException struct {
+	Endpoint     string   `json:"endpoint"`
+	Reason       string   `json:"reason"`
+	Expires      string   `json:"expires"` // YYYY-MM-DD
+	Environments []string `json:"environments"`
+}
+
+// now is replaceable in tests.
+var now = time.Now
+
+// maxExceptionDays caps how far ahead an exception may expire.
+const maxExceptionDays = 90
 
 type Endpoint struct {
 	Name           string `json:"name"`
@@ -373,6 +390,25 @@ func (c *Config) guard() error {
 		add("deployment.dr_region must differ from deployment.primary_region")
 	}
 
+	exceptions := map[string]ResidencyException{}
+	today := now().UTC().Truncate(24 * time.Hour)
+	for _, ex := range c.DataResidency.Exceptions {
+		exp, err := time.Parse("2006-01-02", ex.Expires)
+		switch {
+		case err != nil:
+			add("residency exception for %q: bad expires date %q", ex.Endpoint, ex.Expires)
+		case c.Deployment.Environment == "production":
+			add("residency exception for %q: exceptions are not allowed in production", ex.Endpoint)
+		case !slices.Contains(ex.Environments, c.Deployment.Environment):
+			// Not active in this environment; the endpoint must then be in-jurisdiction.
+		case exp.Before(today):
+			add("residency exception for %q expired on %s", ex.Endpoint, ex.Expires)
+		case exp.After(today.AddDate(0, 0, maxExceptionDays)):
+			add("residency exception for %q expires more than %d days ahead (%s)", ex.Endpoint, maxExceptionDays, ex.Expires)
+		default:
+			exceptions[ex.Endpoint] = ex
+		}
+	}
 	endpoints := map[string]Endpoint{}
 	for _, e := range c.Endpoints {
 		if _, dup := endpoints[e.Name]; dup {
@@ -380,8 +416,15 @@ func (c *Config) guard() error {
 		}
 		endpoints[e.Name] = e
 		if !slices.Contains(c.DataResidency.AllowedJurisdictions, e.Jurisdiction) {
-			add("endpoint %q is in jurisdiction %q, which is not in data_residency.allowed_jurisdictions %v",
-				e.Name, e.Jurisdiction, c.DataResidency.AllowedJurisdictions)
+			if _, ok := exceptions[e.Name]; !ok {
+				add("endpoint %q is in jurisdiction %q, which is not in data_residency.allowed_jurisdictions %v",
+					e.Name, e.Jurisdiction, c.DataResidency.AllowedJurisdictions)
+			}
+		}
+	}
+	for _, ex := range c.DataResidency.Exceptions {
+		if _, ok := endpoints[ex.Endpoint]; !ok {
+			add("residency exception names unknown endpoint %q", ex.Endpoint)
 		}
 	}
 
@@ -490,6 +533,17 @@ func (c *Config) Endpoint(name string) (Endpoint, bool) {
 		}
 	}
 	return Endpoint{}, false
+}
+
+// ActiveExceptions lists the residency exceptions in force (printed at startup).
+func (c *Config) ActiveExceptions() []ResidencyException {
+	var out []ResidencyException
+	for _, ex := range c.DataResidency.Exceptions {
+		if slices.Contains(ex.Environments, c.Deployment.Environment) {
+			out = append(out, ex)
+		}
+	}
+	return out
 }
 
 // Path resolves a config-relative path to an absolute one.

@@ -171,6 +171,16 @@ func Build(ctx context.Context, cfg *config.Config) ([]Provider, error) {
 		switch pc.Kind {
 		case "replay":
 			p = NewReplay(pc.Name, cfg.Path(pc.CassetteDir), pc.Models)
+		case "openai_compat":
+			ep, _ := cfg.Endpoint(pc.Endpoint)
+			key, err := config.ResolveSecret(pc.APIKeyRef)
+			if err != nil {
+				return nil, fmt.Errorf("provider %s: %w", pc.Name, err)
+			}
+			p = NewOpenAICompat(pc.Name, ep.URL, key, ep.Jurisdiction, pc.Models)
+			if pc.Record {
+				p = &Recorder{Inner: p, Dir: cfg.Path(pc.CassetteDir)}
+			}
 		default:
 			sp, err := NewSDKProvider(ctx, pc, cfg.LLM.MaxRetries)
 			if err != nil {

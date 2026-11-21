@@ -1,0 +1,10 @@
+# Real agents on DeepSeek V4.1 Flash via deploy.com (benchmark only; endpoint is
+# outside India and allowed only by the dev residency exception in config.local.yaml).
+extends: config.local.yaml
+agents:
+  mode: llm
+llm:
+  fallback_order: [deepseek]
+budget:
+  per_run_usd: 1
+  per_tenant_daily_usd: 10

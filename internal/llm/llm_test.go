@@ -183,3 +183,18 @@ func TestBedrockRefusesEnvironmentCredentials(t *testing.T) {
 		t.Fatalf("environment credentials were not refused: %v", err)
 	}
 }
+
+func TestModelGeneratedTextIsNotRescanned(t *testing.T) {
+	p := &fakeProvider{name: "a", msg: okMsg}
+	c := call("add a test")
+	c.Params.Messages = append(c.Params.Messages,
+		anthropic.NewAssistantMessage(anthropic.NewTextBlock(`payload = {"card_number": "4111111111111111"}`)),
+		anthropic.NewUserMessage(anthropic.NewTextBlock("tests pass")))
+	if _, err := router(&fakeLedger{}, p).Complete(context.Background(), c); err != nil {
+		t.Fatalf("model's own test data blocked: %v", err)
+	}
+	c2 := call("here is a log line: card 4111111111111111")
+	if _, err := router(&fakeLedger{}, p).Complete(context.Background(), c2); !errors.Is(err, ErrSensitiveData) {
+		t.Fatalf("data we send must still be checked: %v", err)
+	}
+}

@@ -1,0 +1,9 @@
+# USD per million tokens for DeepSeek V4.1 Flash on deploy.com, as listed on the
+# model's playground page (checked 2026-11-21). Recheck before relying on it.
+# Reasoning tokens are billed as output tokens.
+models:
+  deepseek-ai/deepseek-v4.1-flash-1017:
+    input_per_mtok: 0.10
+    output_per_mtok: 0.35
+    cache_read_per_mtok: 0.003
+    cache_write_per_mtok: 0.10   # not listed separately; billed as input

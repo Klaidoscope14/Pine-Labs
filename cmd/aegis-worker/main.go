@@ -28,6 +28,9 @@ func main() {
 		log.Error("refusing to start: config rejected", "error", err.Error())
 		os.Exit(1)
 	}
+	for _, ex := range cfg.ActiveExceptions() {
+		log.Warn("data residency exception in force", "endpoint", ex.Endpoint, "reason", ex.Reason, "expires", ex.Expires)
+	}
 	policy, err := sandbox.PolicyFromConfig(cfg.Sandbox)
 	if err != nil {
 		log.Error("sandbox policy", "error", err.Error())
