@@ -218,6 +218,30 @@ func (m Manager) CommitWorking(ctx context.Context, wt Worktree, message, key st
 	return m.Head(ctx, wt)
 }
 
+// Snapshot records the worktree's current files as a commit object without moving
+// HEAD or the branch (for checking work in progress). Returns the commit and its tree.
+func (m Manager) Snapshot(ctx context.Context, wt Worktree) (commit, tree string, err error) {
+	if _, err := m.git(ctx, wt.Path, "add", "-A"); err != nil {
+		return "", "", err
+	}
+	out, err := m.git(ctx, wt.Path, "write-tree")
+	if err != nil {
+		return "", "", err
+	}
+	tree = strings.TrimSpace(out)
+	out, err = m.git(ctx, wt.Path, "commit-tree", tree, "-p", "HEAD", "-m", "aegis: work-in-progress snapshot")
+	if err != nil {
+		return "", "", err
+	}
+	return strings.TrimSpace(out), tree, nil
+}
+
+// TreeOf returns the tree hash of a commit (identical content gives an identical hash).
+func (m Manager) TreeOf(ctx context.Context, wt Worktree, commit string) (string, error) {
+	out, err := m.git(ctx, wt.Path, "rev-parse", commit+"^{tree}")
+	return strings.TrimSpace(out), err
+}
+
 func (m Manager) findKey(ctx context.Context, wt Worktree, key string) (string, bool, error) {
 	out, err := m.git(ctx, wt.Path, "log", "--format=%H%x00%B%x1e", wt.BaseSHA+"..HEAD")
 	if err != nil {

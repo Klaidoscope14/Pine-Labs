@@ -8,6 +8,7 @@ package workflow
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/temporal"
@@ -39,6 +40,7 @@ const (
 	Killed               Status = "KILLED"
 	BudgetExceeded       Status = "BUDGET_EXCEEDED"
 	AgentRefused         Status = "AGENT_REFUSED"
+	ProviderAccessDenied Status = "PROVIDER_ACCESS_DENIED"
 )
 
 // Settings is the config snapshot a run executes under. Passed in at start, so a
@@ -117,7 +119,7 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			BackoffCoefficient:     2,
 			MaximumInterval:        30 * time.Second,
 			MaximumAttempts:        5,
-			NonRetryableErrorTypes: []string{ErrContract, ErrScenario, ErrAgentRefused, ErrBudget, ErrKilled, ErrSensitiveData, ErrNeedsHuman},
+			NonRetryableErrorTypes: []string{ErrContract, ErrScenario, ErrAgentRefused, ErrBudget, ErrKilled, ErrSensitiveData, ErrNeedsHuman, ErrProviderDenied},
 		},
 	})
 
@@ -169,6 +171,8 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			return BlockedSecurityVeto, true
 		case ErrNeedsHuman:
 			return EscalatedHuman, true
+		case ErrProviderDenied:
+			return ProviderAccessDenied, true
 		}
 		return "", false
 	}
@@ -261,31 +265,79 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			gates  []string
 		}{{GatesTier1, in.Settings.Tier1}, {GatesSecurity, in.Settings.Security}, {GatesTier2, in.Settings.Tier2}}
 		retry := false
-		for _, tier := range tiers {
-			if len(tier.gates) == 0 {
-				continue
+		// PLAN.md §10.5 L3: all tiers start together on the same commit; the verdict
+		// is read in tier order, so the result is exactly what sequential tiers would
+		// give, but the developer also gets every failure at once. Versioned so runs
+		// started before this change replay unchanged.
+		if workflow.GetVersion(ctx, "parallel-gate-tiers", workflow.DefaultVersion, 1) == 1 {
+			var active []struct {
+				status Status
+				gates  []string
 			}
-			if err := record(actx, "gates", tier.status, attempt, dev.CommitSHA, nil); err != nil {
-				return out, err
-			}
-			var ev EvalSummary
-			err := workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
-				HeadSHA: dev.CommitSHA, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates}).Get(actx, &ev)
-			if err != nil {
-				if canceled(err) {
-					return finish(Killed, "run was stopped")
+			for _, tier := range tiers {
+				if len(tier.gates) > 0 {
+					active = append(active, tier)
 				}
-				return out, err
 			}
-			switch ev.Verdict {
-			case "HARD_BLOCK":
-				return finish(Status(ev.BlockStatus), ev.Reason)
-			case "REMEDIABLE_FAIL":
-				diagnostics = ev.Diagnostics
-				retry = true
+			for _, tier := range active {
+				if err := record(actx, "gates", tier.status, attempt, dev.CommitSHA, nil); err != nil {
+					return out, err
+				}
+			}
+			futures := make([]workflow.Future, len(active))
+			for i, tier := range active {
+				futures[i] = workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
+					HeadSHA: dev.CommitSHA, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates})
+			}
+			var diags []string
+			for i := range active {
+				var ev EvalSummary
+				if err := futures[i].Get(actx, &ev); err != nil {
+					if canceled(err) {
+						return finish(Killed, "run was stopped")
+					}
+					return out, err
+				}
+				switch ev.Verdict {
+				case "HARD_BLOCK":
+					return finish(Status(ev.BlockStatus), ev.Reason)
+				case "REMEDIABLE_FAIL":
+					retry = true
+					if ev.Diagnostics != "" {
+						diags = append(diags, ev.Diagnostics)
+					}
+				}
 			}
 			if retry {
-				break
+				diagnostics = strings.Join(diags, "\n")
+			}
+		} else {
+			for _, tier := range tiers {
+				if len(tier.gates) == 0 {
+					continue
+				}
+				if err := record(actx, "gates", tier.status, attempt, dev.CommitSHA, nil); err != nil {
+					return out, err
+				}
+				var ev EvalSummary
+				err := workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
+					HeadSHA: dev.CommitSHA, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates}).Get(actx, &ev)
+				if err != nil {
+					if canceled(err) {
+						return finish(Killed, "run was stopped")
+					}
+					return out, err
+				}
+				switch ev.Verdict {
+				case "HARD_BLOCK":
+					return finish(Status(ev.BlockStatus), ev.Reason)
+				case "REMEDIABLE_FAIL":
+					diagnostics = ev.Diagnostics
+					retry = true
+				}
+				if retry {
+					break
+				}
 			}
 		}
 		if !retry {

@@ -16,6 +16,11 @@ data_residency:
       reason: Benchmark DeepSeek V4.1 Flash against Claude Opus 5 on synthetic data
       expires: "2026-12-31"
       environments: [local]
+    # Model benchmark only: Claude through the local Claude Code CLI (Anthropic, outside India).
+    - endpoint: llm-claude-code
+      reason: Benchmark Claude Sonnet 5.5 against DeepSeek V4.1 Flash on synthetic data
+      expires: "2026-12-31"
+      environments: [local]
 
 endpoints:
   - { name: postgres-admin, kind: database,     url: "postgres://aegis@127.0.0.1:5432/aegis", jurisdiction: IN, credentials_ref: env:POSTGRES_PASSWORD }
@@ -29,6 +34,7 @@ endpoints:
   - { name: code-host,    kind: code_host,      url: "file://./.data/git",    jurisdiction: IN }
   - { name: llm-bedrock-india, kind: llm,        url: "https://bedrock-runtime.ap-south-1.amazonaws.com", jurisdiction: IN }
   - { name: llm-deploy-sf,  kind: llm,        url: "https://api-sf1-cdn.deploy.com/api/v1", jurisdiction: US }
+  - { name: llm-claude-code, kind: llm,      url: "https://api.anthropic.com", jurisdiction: US }
   - { name: llm-fake,     kind: llm,            url: "file://./evals/cassettes", jurisdiction: IN }
 
 llm:
@@ -53,7 +59,7 @@ llm:
       allowed_regions: [ap-south-1, ap-south-2]
       price_table_ref: prices/bedrock-india.yaml
       record: true                 # keep responses for offline replay (refused in production)
-      cassette_dir: evals/cassettes/recorded/bedrock-india
+      cassette_dir: .data/cassettes/recorded/bedrock-india
       models:
         analyst: in.anthropic.claude-opus-5
         architect: in.anthropic.claude-opus-5
@@ -66,12 +72,26 @@ llm:
       api_key_ref: env:DEPLOY_API_KEY
       price_table_ref: prices/deploy-com.yaml
       record: true
-      cassette_dir: evals/cassettes/recorded/deepseek
+      cassette_dir: .data/cassettes/recorded/deepseek
       models:
         analyst: deepseek-ai/deepseek-v4.1-flash-1017
         architect: deepseek-ai/deepseek-v4.1-flash-1017
         developer: deepseek-ai/deepseek-v4.1-flash-1017
         release: deepseek-ai/deepseek-v4.1-flash-1017
+    # Claude Sonnet 5.5 through the local Claude Code CLI, signed in with the operator's
+    # Claude subscription (no API key). Benchmark use only; refused in production.
+    - name: claude-code
+      kind: claude_code
+      endpoint: llm-claude-code
+      command: claude
+      price_table_ref: prices/claude-code.yaml
+      record: true
+      cassette_dir: .data/cassettes/recorded/claude-code
+      models:
+        analyst: claude-sonnet-5-5
+        architect: claude-sonnet-5-5
+        developer: claude-sonnet-5-5
+        release: claude-sonnet-5-5
   fallback_order: [replay]
   max_retries: 2
   roles:
@@ -98,6 +118,8 @@ sandbox:
   warm_pool_size: 2
   network: none
   max_output_bytes: 4194304
+  max_concurrent: 4
+  host_reserve_mb: 4096
 tenants:
   - { id: payments-team,    concurrency: 4, queue_priority: high,   daily_usd: 50 }
   - { id: settlements-team, concurrency: 4, queue_priority: normal, daily_usd: 50 }
@@ -141,6 +163,7 @@ agents:
   max_tool_calls: 40
   max_read_bytes: 65536
   max_run_tests: 4
+  max_finish_refusals: 2   # self-check before finish: fix failures within the attempt
   max_context_bytes: 200000
   prompts_dir: prompts
   import_graph_script: tools/importgraph.py

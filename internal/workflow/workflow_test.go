@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -197,27 +201,59 @@ func TestApprovalExpires(t *testing.T) {
 	}
 }
 
-func TestTier2RunsOnlyAfterEarlierTiersPass(t *testing.T) {
+func TestAllTiersRunEachAttemptAndFailuresAreCombined(t *testing.T) {
 	h := newHarness(t)
-	h.develop(DevelopResult{CommitSHA: "c1"}, DevelopResult{CommitSHA: "c2"})
-	var tiers []string
+	var diagSeen string
+	n := 0
+	h.env.OnActivity(h.a.Develop, mock.Anything, mock.Anything).Return(func(_ context.Context, in DevelopActivityInput) (DevelopResult, error) {
+		n++
+		if n == 2 {
+			diagSeen = in.Diagnostics
+		}
+		return DevelopResult{CommitSHA: fmt.Sprintf("c%d", n)}, nil
+	})
+	var mu sync.Mutex
+	ran := map[int][]string{}
 	h.env.OnActivity(h.a.Evaluate, mock.Anything, mock.Anything).Return(func(_ context.Context, in EvalInput) (EvalSummary, error) {
-		tiers = append(tiers, in.Tier)
-		if in.Tier == string(GatesTier1) && in.Attempt == 1 {
-			return fail("x"), nil
+		mu.Lock()
+		ran[in.Attempt] = append(ran[in.Attempt], in.Tier)
+		mu.Unlock()
+		if in.Attempt == 1 && in.Tier == string(GatesTier1) {
+			return fail("[lint] S105 tests/x.py:3"), nil
+		}
+		if in.Attempt == 1 && in.Tier == string(GatesTier2) {
+			return fail("[openapi] breaking change"), nil
 		}
 		return EvalSummary{Verdict: "PASS"}, nil
 	})
 	h.approveAfter(time.Minute, true)
-	h.run(t)
-	want := []string{"GATES_TIER1", "GATES_TIER1", "GATES_SECURITY", "GATES_TIER2"}
-	if len(tiers) != len(want) {
-		t.Fatalf("tiers ran %v, want %v", tiers, want)
+	res := h.run(t)
+	if res.Status != Approved {
+		t.Fatalf("final status %s, want %s", res.Status, Approved)
 	}
-	for i := range want {
-		if tiers[i] != want[i] {
-			t.Fatalf("tiers ran %v, want %v", tiers, want)
+	for attempt := 1; attempt <= 2; attempt++ {
+		got := append([]string(nil), ran[attempt]...)
+		sort.Strings(got)
+		want := []string{"GATES_SECURITY", "GATES_TIER1", "GATES_TIER2"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("attempt %d ran tiers %v, want all of %v", attempt, got, want)
 		}
+	}
+	if !strings.Contains(diagSeen, "S105") || !strings.Contains(diagSeen, "breaking change") {
+		t.Fatalf("retry should see failures from every tier, got %q", diagSeen)
+	}
+}
+
+func TestHardBlockIsNeverMaskedByEarlierRemediableFailure(t *testing.T) {
+	h := newHarness(t)
+	h.develop(DevelopResult{CommitSHA: "c1"})
+	h.evaluate(map[string]EvalSummary{
+		string(GatesTier1):    fail("[lint] E501"),
+		string(GatesSecurity): {Verdict: "HARD_BLOCK", BlockStatus: string(BlockedSecurityVeto), Reason: "secrets: leaked key"},
+	})
+	res := h.run(t)
+	if res.Status != BlockedSecurityVeto {
+		t.Fatalf("status %s, want %s", res.Status, BlockedSecurityVeto)
 	}
 }
 

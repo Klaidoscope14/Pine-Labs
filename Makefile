@@ -115,5 +115,14 @@ cassettes: ## Regenerate the scripted offline cassettes for live-happy
 phase2-offline: build ## Real agents on replayed responses; card number must never leave the machine
 	@$(SECRETS_ENV) scripts/phase2-offline.sh $(LOGS)
 
-phase2-live: build ## SPENDS MONEY: Bedrock India runs (5 in a row, protected file, kill switch)
-	@$(SECRETS_ENV) scripts/phase2-live.sh $(LOGS) $(or $(RUNS),5)
+phase2-live: build ## SPENDS MONEY: live runs (5x Demo 1, protected file, kill switch). LIVE_CONFIG=config.deepseek.yaml for DeepSeek, PARALLEL=1 to run them at once
+	@$(SECRETS_ENV) PARALLEL=$(PARALLEL) scripts/phase2-live.sh $(LOGS) $(or $(RUNS),5) $(or $(LIVE_CONFIG),config.bedrock.yaml)
+
+# ---------------- AWS (PLAN.md §10.4) ----------------
+.PHONY: deploy deploy-tunnel
+
+deploy: ## Create/update the EC2 stack and (re)deploy this working tree: AWS_REGION=<india-region> make deploy
+	@scripts/aws-deploy.sh
+
+deploy-tunnel: ## Forward a UI from the instance: AWS_REGION=... make deploy-tunnel INSTANCE=i-... PORT=3000
+	@scripts/aws-tunnel.sh $(INSTANCE) $(PORT)

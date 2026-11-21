@@ -102,7 +102,7 @@ type LLM struct {
 
 type Provider struct {
 	Name                 string            `json:"name"`
-	Kind                 string            `json:"kind"` // anthropic | bedrock | replay
+	Kind                 string            `json:"kind"` // anthropic | bedrock | openai_compat | claude_code | replay
 	Endpoint             string            `json:"endpoint"`
 	APIKeyRef            string            `json:"api_key_ref"`
 	Models               map[string]string `json:"models"`
@@ -113,20 +113,28 @@ type Provider struct {
 	Record               bool              `json:"record,omitempty"`
 	VerifyProfileRouting bool              `json:"verify_profile_routing,omitempty"`
 	AllowedRegions       []string          `json:"allowed_regions,omitempty"`
+	// Command is the Claude Code CLI to run (kind claude_code; default "claude").
+	Command string `json:"command,omitempty"`
 }
 
 // RoleSettings tunes one agent role.
 type RoleSettings struct {
 	Effort    string `json:"effort"`
 	MaxTokens int    `json:"max_tokens"`
+	// RoutineEffort (developer only) is used for routine tool turns; the first turn
+	// and any turn after a failed tool call, check or refused finish use Effort.
+	RoutineEffort string `json:"routine_effort,omitempty"`
 }
 
 // Agents configures how agents run.
 type Agents struct {
-	Mode              string `json:"mode"` // stub | llm
-	MaxToolCalls      int    `json:"max_tool_calls"`
-	MaxReadBytes      int    `json:"max_read_bytes"`
-	MaxRunTests       int    `json:"max_run_tests"`
+	Mode         string `json:"mode"` // stub | llm
+	MaxToolCalls int    `json:"max_tool_calls"`
+	MaxReadBytes int    `json:"max_read_bytes"`
+	MaxRunTests  int    `json:"max_run_tests"`
+	// MaxFinishRefusals is how many times finish is refused while the self-check
+	// (diff budget, lint, tests) fails; 0 turns the self-check off.
+	MaxFinishRefusals int    `json:"max_finish_refusals"`
 	MaxContextBytes   int    `json:"max_context_bytes"`
 	PromptsDir        string `json:"prompts_dir"`
 	ImportGraphScript string `json:"import_graph_script"`
@@ -169,6 +177,13 @@ type Sandbox struct {
 	WarmPoolSize   int     `json:"warm_pool_size"`
 	Network        string  `json:"network"`
 	MaxOutputBytes int64   `json:"max_output_bytes"`
+	// MaxConcurrent caps sandboxes running at once on this host (queue, never overload).
+	MaxConcurrent int `json:"max_concurrent"`
+	// HostReserveMB is memory kept for the platform, worker and OS; the worker refuses
+	// to start if max_concurrent × memory_mb + host_reserve_mb exceeds the host's memory.
+	HostReserveMB int `json:"host_reserve_mb"`
+	// Runtime is the OCI runtime for sandboxes: "" (Docker default) or "runsc" (gVisor).
+	Runtime string `json:"runtime,omitempty"`
 }
 
 type Tenant struct {
@@ -450,6 +465,11 @@ func (c *Config) guard() error {
 			}
 			if p.VerifyProfileRouting && len(p.AllowedRegions) == 0 {
 				add("llm provider %q verifies profile routing but lists no allowed_regions", p.Name)
+			}
+		case "claude_code":
+			// Uses a personal Claude subscription through the local CLI: benchmarking only.
+			if c.Deployment.Environment == "production" {
+				add("llm provider %q (claude_code) is for local benchmarking and is not allowed in production", p.Name)
 			}
 		case "replay":
 			if p.CassetteDir == "" {

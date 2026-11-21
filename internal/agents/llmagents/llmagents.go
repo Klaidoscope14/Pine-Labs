@@ -17,7 +17,9 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -96,9 +98,14 @@ func (s *session) system() []anthropic.TextBlockParam {
 }
 
 func (s *session) call(ctx context.Context, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+	return s.callEffort(ctx, "", params)
+}
+
+// callEffort makes a call with an optional effort override ("" = the role's effort).
+func (s *session) callEffort(ctx context.Context, effort string, params anthropic.MessageNewParams) (*anthropic.Message, error) {
 	res, err := s.a.Router.Complete(ctx, llm.Call{TenantID: s.run.TenantID, RunID: s.run.RunID, Role: s.role,
 		Attempt: s.run.Attempt, Seq: s.seq, Cassette: s.run.Scenario, PromptHash: s.a.prompts[s.role].hash,
-		Redactions: s.redactions, Params: params})
+		Redactions: s.redactions, Effort: effort, Params: params})
 	s.seq++
 	if err != nil {
 		return nil, err
@@ -201,6 +208,64 @@ func sourcePack(root string, files []string, budget int) string {
 		b.WriteString(fmt.Sprintf("<file path=%q>\n%s\n</file>\n", f, body))
 	}
 	return b.String()
+}
+
+// plannedContext returns the planned files plus the tests that mention them, and
+// the files whose complete content fit in the budget.
+func plannedContext(root string, planned, protected []string, budget int) (string, []string) {
+	all := tree(root)
+	var code, tests []string
+	stems := map[string]bool{}
+	for _, f := range all {
+		if !strings.HasSuffix(f, ".py") || matchAny(protected, f) || !matchAny(planned, f) {
+			continue
+		}
+		if isTest(f) {
+			tests = append(tests, f)
+			continue
+		}
+		code = append(code, f)
+		stems[strings.TrimSuffix(path.Base(f), ".py")] = true
+	}
+	for _, f := range all {
+		if !isTest(f) || !strings.HasSuffix(f, ".py") || slices.Contains(tests, f) || matchAny(protected, f) {
+			continue
+		}
+		body := readSmall(root, f, 1<<20)
+		for stem := range stems {
+			if stem != "__init__" && strings.Contains(body, stem) {
+				tests = append(tests, f)
+				break
+			}
+		}
+	}
+	var b strings.Builder
+	var full []string
+	used := 0
+	for _, f := range append(code, tests...) {
+		info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(f)))
+		if err != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		if used+int(info.Size()) > budget {
+			fmt.Fprintf(&b, "<file path=%q omitted=\"context budget reached; use read_file\"/>\n", f)
+			continue
+		}
+		body := readSmall(root, f, int(info.Size()))
+		used += len(body)
+		fmt.Fprintf(&b, "<file path=%q>\n%s\n</file>\n", f, body)
+		full = append(full, f)
+	}
+	return b.String(), full
+}
+
+func matchAny(globs []string, p string) bool {
+	for _, g := range globs {
+		if ok, err := doublestar.Match(g, p); err == nil && ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Agents) importGraph(ctx context.Context, worktree, repoName string) string {
@@ -316,6 +381,27 @@ func (a *Agents) runTests(worktree string) func(context.Context, string) (string
 	}
 }
 
+func (a *Agents) runLint(worktree string) func(context.Context, string) (string, error) {
+	return func(ctx context.Context, path string) (string, error) {
+		target := "."
+		if path != "" {
+			target = path
+		}
+		res, err := a.Sandbox.Run(ctx, sandbox.Spec{Image: a.Image, Workdir: "/work",
+			Cmd:     []string{"ruff", "check", "--no-cache", "--output-format", "concise", target},
+			Timeout: time.Duration(a.Cfg.Sandbox.TimeoutSeconds) * time.Second,
+			Mounts:  []sandbox.Mount{{HostPath: worktree, ContainerPath: "/work", ReadOnly: true}}})
+		if err != nil {
+			return "", err
+		}
+		out := strings.TrimSpace(string(res.Stdout) + string(res.Stderr))
+		if len(out) > 3000 {
+			out = out[:3000] + "\n…"
+		}
+		return fmt.Sprintf("exit code %d\n%s", res.ExitCode, out), nil
+	}
+}
+
 func (a *Agents) Develop(ctx context.Context, in agents.DevelopInput) (agents.DevelopOutput, error) {
 	s := a.session(in.Run, "developer")
 	var p plan
@@ -325,24 +411,72 @@ func (a *Agents) Develop(ctx context.Context, in agents.DevelopInput) (agents.De
 	gw := &gateway.Gateway{Root: in.Worktree, Protected: a.Cfg.Scope.ProtectedPaths,
 		Planned: p.Scope.Planned, Adjacent: p.Scope.Adjacent, Writable: true,
 		MaxRead: a.Cfg.Agents.MaxReadBytes, MaxCalls: a.Cfg.Agents.MaxToolCalls, MaxRunTests: a.Cfg.Agents.MaxRunTests,
-		RunTests: a.runTests(in.Worktree),
+		RunTests:          a.runTests(in.Worktree),
+		RunLint:           a.runLint(in.Worktree),
+		MaxFinishRefusals: a.Cfg.Agents.MaxFinishRefusals,
 		Audit: func(ctx context.Context, c gateway.Call) {
 			if a.Audit != nil {
 				a.Audit(ctx, ledger.ToolCall{TenantID: in.TenantID, RunID: in.RunID, Role: "developer", Attempt: in.Attempt,
 					Tool: c.Tool, ArgsHash: c.ArgsHash, Allowed: c.Allowed, Reason: c.Reason, DurationMS: c.DurationMS})
 			}
 		}}
+	if in.BaseSHA != "" {
+		gw.DiffNote = diffNoter(in.Worktree, in.BaseSHA, in.BudgetFiles, in.BudgetLines)
+		check := a.selfCheck(in.Worktree, in.BaseSHA, in.BudgetFiles, in.BudgetLines)
+		if in.SelfCheck != nil {
+			// The real gates (scope, lint, tests), plus the size breakdown that tells
+			// the model which files to shrink.
+			check = func(ctx context.Context) string {
+				var b strings.Builder
+				if stats, err := diffStat(ctx, in.Worktree, in.BaseSHA); err == nil {
+					b.WriteString(budgetProblem(stats, in.BudgetFiles, in.BudgetLines))
+				}
+				if d := in.SelfCheck(ctx); d != "" {
+					b.WriteString(d + "\n")
+				}
+				return b.String()
+			}
+		}
+		gw.Check = check
+		if a.Cfg.Agents.MaxFinishRefusals > 0 {
+			gw.PreFinish = check
+		}
+	}
 	brief := fence("specification", string(in.RequirementSpec)) + fence("plan", string(in.Plan))
+	// PLAN.md §10.5 L6: the planned files and the tests that cover them, up front,
+	// so the loop starts editing instead of spending turns reading.
+	if pack, full := plannedContext(in.Worktree, p.Scope.Planned, a.Cfg.Scope.ProtectedPaths, a.Cfg.Agents.MaxContextBytes/4); pack != "" {
+		brief += fence("planned_files", pack) +
+			"These are the current, complete contents of the planned files and their tests; you may edit them directly without reading them again.\n"
+		gw.MarkRead(full)
+	}
 	if in.Diagnostics != "" {
 		brief += fence("previous_attempt_failures", in.Diagnostics) +
 			"Your previous attempt is already in the worktree. Fix exactly these failures.\n"
+	}
+	if in.BudgetLines > 0 {
+		brief += fmt.Sprintf("Diff budget: at most %d changed lines (added + deleted, tests included) in at most %d files, measured against the base.\n",
+			in.BudgetLines, in.BudgetFiles)
+		if in.Diagnostics != "" {
+			if stats, err := diffStat(ctx, in.Worktree, in.BaseSHA); err == nil {
+				brief += diffNote(stats, in.BudgetFiles, in.BudgetLines) + ".\n"
+			}
+		}
 	}
 	brief += "Implement the plan. Start by reading the planned files."
 	msgs := []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(s.clean(brief)))}
 	tools := gw.Tools()
 	nudged := false
+	// Adaptive effort (PLAN.md §10.5, L10): think hard when planning or recovering
+	// from a failure; routine reads and edits use the cheaper routine effort.
+	routine := a.Cfg.LLM.Roles["developer"].RoutineEffort
+	struggling := true // the first turn plans the change
 	for turn := 0; turn < a.Cfg.Agents.MaxToolCalls+4; turn++ {
-		resp, err := s.call(ctx, anthropic.MessageNewParams{System: s.system(), Messages: msgs, Tools: tools,
+		effort := ""
+		if !struggling {
+			effort = routine
+		}
+		resp, err := s.callEffort(ctx, effort, anthropic.MessageNewParams{System: s.system(), Messages: msgs, Tools: tools,
 			CacheControl: anthropic.NewCacheControlEphemeralParam()})
 		if err != nil {
 			return agents.DevelopOutput{}, err
@@ -353,18 +487,23 @@ func (a *Agents) Develop(ctx context.Context, in agents.DevelopInput) (agents.De
 				break
 			}
 			nudged = true
+			struggling = true
 			msgs = append(msgs, anthropic.NewUserMessage(anthropic.NewTextBlock(
 				"Continue working with the tools. When the change is complete and tested, call finish.")))
 			continue
 		}
 		var results []anthropic.ContentBlockParamUnion
 		var done *gateway.Outcome
+		struggling = false
 		for _, block := range resp.Content {
 			tu, ok := block.AsAny().(anthropic.ToolUseBlock)
 			if !ok {
 				continue
 			}
 			out := gw.Execute(ctx, tu.Name, json.RawMessage(tu.JSON.Input.Raw()))
+			if out.IsError || strings.HasPrefix(out.Content, "checks fail") || (tu.Name == "run_tests" || tu.Name == "run_lint") && exitCode(out.Content) > 0 {
+				struggling = true
+			}
 			results = append(results, anthropic.NewToolResultBlock(tu.ID, out.Content, out.IsError))
 			if (out.Done || out.Abort) && done == nil {
 				o := out

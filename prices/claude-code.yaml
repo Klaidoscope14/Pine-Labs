@@ -1,0 +1,10 @@
+# USD per million tokens for Claude Sonnet 5.5 at API list price. Runs through Claude
+# Code are paid by subscription, so this cost is NOTIONAL: what the same tokens would
+# cost on the API. Rates reproduce Claude Code's own costUSD (costBasis "list") on a
+# test call (2026-11-22). Claude Code writes 1-hour cache entries, billed at 2x input.
+models:
+  claude-sonnet-5-5:
+    input_per_mtok: 2.00
+    output_per_mtok: 10.00
+    cache_read_per_mtok: 0.20
+    cache_write_per_mtok: 4.00

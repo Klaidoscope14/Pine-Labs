@@ -98,6 +98,8 @@ sandbox:
   warm_pool_size: 2
   network: bridge
   max_output_bytes: 4194304
+  max_concurrent: 4
+  host_reserve_mb: 4096
 tenants:
   - { id: payments-team,    concurrency: 4, queue_priority: high,   daily_usd: 50 }
   - { id: settlements-team, concurrency: 4, queue_priority: normal, daily_usd: 50 }

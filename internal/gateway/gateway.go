@@ -78,13 +78,28 @@ type Gateway struct {
 	MaxRunTests int
 	// RunTests runs the repo's tests in the sandbox and returns a short summary.
 	RunTests func(ctx context.Context, selector string) (string, error)
+	// RunLint runs the repo's linter in the sandbox (the same check as the lint gate).
+	RunLint func(ctx context.Context, path string) (string, error)
 	// Audit records every call (ledger).
 	Audit func(ctx context.Context, c Call)
+	// DiffNote, if set, describes the change so far (size against the budget);
+	// it is appended to every successful edit so the model sees where it stands.
+	DiffNote func(ctx context.Context) string
+	// PreFinish, if set, runs the cheap checks the gates would run (diff budget,
+	// lint, tests) and returns what fails ("" when clean). finish is refused with
+	// those failures up to MaxFinishRefusals times, so they are fixed within the
+	// attempt instead of costing one. The real gates still run afterwards.
+	PreFinish func(ctx context.Context) string
+	// Check backs the `check` tool: the same checks on demand (counts as a test run).
+	Check             func(ctx context.Context) string
+	MaxFinishRefusals int
 
 	read       map[string]bool
 	seen       map[string]int
 	calls      int
 	runs       int
+	lints      int
+	refusals   int
 	Redactions int
 }
 
@@ -252,6 +267,22 @@ func (g *Gateway) execute(ctx context.Context, name string, input json.RawMessag
 			return fail("invalid input: " + err.Error())
 		}
 		return g.editFile(in.Path, in.OldText, in.NewText)
+	case "edit_files":
+		var in struct {
+			Edits []struct {
+				Path    string `json:"path"`
+				OldText string `json:"old_text"`
+				NewText string `json:"new_text"`
+			} `json:"edits"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil || len(in.Edits) == 0 {
+			return fail("edit_files needs a non-empty edits list")
+		}
+		edits := make([]edit, len(in.Edits))
+		for i, e := range in.Edits {
+			edits[i] = edit{e.Path, e.OldText, e.NewText}
+		}
+		return g.editFiles(edits)
 	case "create_file":
 		var in struct {
 			Path    string `json:"path"`
@@ -269,6 +300,16 @@ func (g *Gateway) execute(ctx context.Context, name string, input json.RawMessag
 			return fail("invalid input: " + err.Error())
 		}
 		return g.runTests(ctx, in.Selector)
+	case "run_lint":
+		var in struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return fail("invalid input: " + err.Error())
+		}
+		return g.runLint(ctx, in.Path)
+	case "check":
+		return g.check(ctx)
 	case "raise_conflict":
 		var c Conflict
 		if err := json.Unmarshal(input, &c); err != nil || c.Reason == "" {
@@ -282,6 +323,13 @@ func (g *Gateway) execute(ctx context.Context, name string, input json.RawMessag
 		}
 		if err := json.Unmarshal(input, &in); err != nil || in.Summary == "" {
 			return fail("finish needs a summary")
+		}
+		if g.PreFinish != nil && g.refusals < g.MaxFinishRefusals {
+			if problems := g.PreFinish(ctx); problems != "" {
+				g.refusals++
+				return fail(fmt.Sprintf("finish refused (%d of %d): these checks fail and would send the change back.\n%s\n"+
+					"Fix them, then call finish again.", g.refusals, g.MaxFinishRefusals, g.redact(problems)))
+			}
 		}
 		return Outcome{Content: "done", Done: true, Summary: in.Summary, Decisions: in.Decisions}
 	default:
@@ -438,7 +486,62 @@ func (g *Gateway) editFile(rel, oldText, newText string) Outcome {
 	if err := os.WriteFile(abs, []byte(updated), 0o644); err != nil {
 		return fail(err.Error())
 	}
-	return Outcome{Content: "edited " + c}
+	return Outcome{Content: "edited " + c + g.diffNote(context.Background())}
+}
+
+type edit struct{ path, oldText, newText string }
+
+// maxBatchEdits caps one edit_files call.
+const maxBatchEdits = 20
+
+// editFiles applies several edits atomically: every edit is checked (scope,
+// protected paths, read-before-edit, exact single match against the content as
+// earlier edits in the batch leave it) before any file is written.
+func (g *Gateway) editFiles(edits []edit) Outcome {
+	if len(edits) > maxBatchEdits {
+		return fail(fmt.Sprintf("at most %d edits per call", maxBatchEdits))
+	}
+	pending := map[string]string{} // canonical path -> new content
+	abs := map[string]string{}
+	var order []string
+	for i, e := range edits {
+		c, a, err := g.resolveExisting(e.path)
+		if err != nil {
+			return fail(fmt.Sprintf("edit %d: %v; nothing was changed", i+1, err))
+		}
+		if err := g.canWrite(c); err != nil {
+			return fail(fmt.Sprintf("edit %d: %v; nothing was changed", i+1, err))
+		}
+		if !g.read[c] {
+			return fail(fmt.Sprintf("edit %d: read %s before editing it; nothing was changed", i+1, c))
+		}
+		if info, err := os.Lstat(a); err != nil || info.Mode()&fs.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fail(fmt.Sprintf("edit %d: can only edit regular files; nothing was changed", i+1))
+		}
+		cur, ok := pending[c]
+		if !ok {
+			data, err := os.ReadFile(a)
+			if err != nil {
+				return fail(err.Error())
+			}
+			cur = string(data)
+			abs[c] = a
+			order = append(order, c)
+		}
+		if e.oldText == "" {
+			return fail(fmt.Sprintf("edit %d: old_text must not be empty; nothing was changed", i+1))
+		}
+		if n := strings.Count(cur, e.oldText); n != 1 {
+			return fail(fmt.Sprintf("edit %d: old_text must match exactly once in %s (matched %d times); nothing was changed", i+1, c, n))
+		}
+		pending[c] = strings.Replace(cur, e.oldText, e.newText, 1)
+	}
+	for _, c := range order {
+		if err := os.WriteFile(abs[c], []byte(pending[c]), 0o644); err != nil {
+			return fail(err.Error())
+		}
+	}
+	return Outcome{Content: fmt.Sprintf("applied %d edits to %s", len(edits), strings.Join(order, ", ")) + g.diffNote(context.Background())}
 }
 
 func (g *Gateway) createFile(rel, content string) Outcome {
@@ -467,7 +570,42 @@ func (g *Gateway) createFile(rel, content string) Outcome {
 		return fail(err.Error())
 	}
 	g.read[c] = true
-	return Outcome{Content: "created " + c}
+	return Outcome{Content: "created " + c + g.diffNote(context.Background())}
+}
+
+func (g *Gateway) check(ctx context.Context) Outcome {
+	if !g.Writable || g.Check == nil {
+		return fail("check is not available to this role")
+	}
+	g.runs++
+	if g.MaxRunTests > 0 && g.runs > g.MaxRunTests {
+		return fail(fmt.Sprintf("test run limit (%d) reached for this attempt", g.MaxRunTests))
+	}
+	if problems := g.Check(ctx); problems != "" {
+		return Outcome{Content: "checks fail:\n" + g.redact(problems)}
+	}
+	return Outcome{Content: "all checks pass: diff budget, scope, lint and tests" + g.diffNote(ctx)}
+}
+
+// MarkRead records files whose full current content the agent was already given
+// (in its brief), so it can edit them without a separate read_file turn.
+func (g *Gateway) MarkRead(paths []string) {
+	g.init()
+	for _, p := range paths {
+		if c, err := clean(p); err == nil {
+			g.read[c] = true
+		}
+	}
+}
+
+func (g *Gateway) diffNote(ctx context.Context) string {
+	if g.DiffNote == nil {
+		return ""
+	}
+	if n := g.DiffNote(ctx); n != "" {
+		return "\n" + n
+	}
+	return ""
 }
 
 func (g *Gateway) runTests(ctx context.Context, selector string) Outcome {
@@ -484,6 +622,28 @@ func (g *Gateway) runTests(ctx context.Context, selector string) Outcome {
 	summary, err := g.RunTests(ctx, selector)
 	if err != nil {
 		return fail("could not run tests: " + err.Error())
+	}
+	return Outcome{Content: g.redact(summary)}
+}
+
+func (g *Gateway) runLint(ctx context.Context, path string) Outcome {
+	if !g.Writable || g.RunLint == nil {
+		return fail("run_lint is not available to this role")
+	}
+	if path != "" {
+		c, err := clean(path)
+		if err != nil {
+			return fail(err.Error())
+		}
+		path = c
+	}
+	g.lints++
+	if g.MaxRunTests > 0 && g.lints > g.MaxRunTests {
+		return fail(fmt.Sprintf("run_lint limit (%d) reached for this attempt", g.MaxRunTests))
+	}
+	summary, err := g.RunLint(ctx, path)
+	if err != nil {
+		return fail("could not run the linter: " + err.Error())
 	}
 	return Outcome{Content: g.redact(summary)}
 }
@@ -529,13 +689,22 @@ func (g *Gateway) Tools() []anthropic.ToolUnionParam {
 		tool("search_code", "Search repository files with a regular expression. path_glob narrows the files (e.g. \"app/**/*.py\"); empty searches everything.",
 			map[string]any{"pattern": str, "path_glob": str}),
 	}
+	if g.Writable && g.Check != nil {
+		tools = append(tools, tool("check", "Run every check the reviewers will run on your change so far, in one call: diff budget, scope, lint and the full tests. Prefer this over run_lint + run_tests before finishing.", map[string]any{}))
+	}
 	if g.Writable {
 		tools = append(tools,
 			tool("edit_file", "Replace old_text with new_text in a file you have already read. old_text must match exactly once.",
 				map[string]any{"path": str, "old_text": str, "new_text": str}),
+			tool("edit_files", "Apply several edits in one call (all or nothing). Each edit is like edit_file; edits to the same file apply in order. Use this to make a planned change in one step.",
+				map[string]any{"edits": map[string]any{"type": "array", "items": map[string]any{
+					"type": "object", "additionalProperties": false, "required": []string{"path", "old_text", "new_text"},
+					"properties": map[string]any{"path": str, "old_text": str, "new_text": str}}}}),
 			tool("create_file", "Create a new file inside the planned scope.", map[string]any{"path": str, "content": str}),
 			tool("run_tests", "Run the repository's tests in the sandbox. selector is a test file or node id; empty runs everything.",
 				map[string]any{"selector": str}),
+			tool("run_lint", "Run the repository's linter (the same check the lint gate applies). path is a file or directory; empty checks everything.",
+				map[string]any{"path": str}),
 			tool("raise_conflict", "Stop and report that the plan cannot be implemented within its scope. List the extra paths you would need.",
 				map[string]any{"reason": str, "needed_paths": map[string]any{"type": "array", "items": str}}),
 			tool("finish", "Finish the attempt with a short summary and the judgement calls you made.",

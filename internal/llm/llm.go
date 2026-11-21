@@ -32,6 +32,7 @@ var (
 	ErrSensitiveData = errors.New("request still contains sensitive data")
 	ErrUnavailable   = errors.New("all model providers unavailable")
 	ErrNoCassette    = errors.New("no recorded response for this call")
+	ErrAccessDenied  = errors.New("model provider denied access")
 )
 
 // Call is one model request from one agent.
@@ -48,7 +49,9 @@ type Call struct {
 	PromptHash string
 	// Redactions is how many values the caller redacted while building the request.
 	Redactions int
-	Params     anthropic.MessageNewParams
+	// Effort, if set, overrides the role's effort for this call (adaptive effort).
+	Effort string
+	Params anthropic.MessageNewParams
 }
 
 // Result is a successful response.
@@ -130,6 +133,20 @@ func cost(p Price, ok bool, u anthropic.Usage) *float64 {
 	return &c
 }
 
+// accessDenied reports an authentication or authorisation refusal (401/403):
+// retrying or falling back cannot fix it; a human must (e.g. billing, keys).
+func accessDenied(err error) bool {
+	var apierr *anthropic.Error
+	if errors.As(err, &apierr) {
+		return apierr.StatusCode == 401 || apierr.StatusCode == 403
+	}
+	var herr *HTTPError
+	if errors.As(err, &herr) {
+		return herr.StatusCode == 401 || herr.StatusCode == 403
+	}
+	return false
+}
+
 // retryable reports whether a provider error should fall through to the next provider.
 func retryable(err error) bool {
 	var apierr *anthropic.Error
@@ -174,6 +191,9 @@ func (r *Router) Complete(ctx context.Context, call Call) (Result, error) {
 	params := call.Params
 	params.MaxTokens = int64(role.MaxTokens)
 	params.OutputConfig.Effort = anthropic.OutputConfigEffort(role.Effort)
+	if call.Effort != "" {
+		params.OutputConfig.Effort = anthropic.OutputConfigEffort(call.Effort)
+	}
 
 	// Fail closed: the agent layer redacts while building the request; anything
 	// still detectable here means a path skipped redaction, so nothing is sent.
@@ -197,6 +217,9 @@ func (r *Router) Complete(ctx context.Context, call Call) (Result, error) {
 		if err != nil {
 			rec.Error = truncate(err.Error(), 300)
 			_ = r.Ledger.RecordLLMCall(ctx, rec)
+			if accessDenied(err) {
+				return Result{}, fmt.Errorf("%w (%s): %v", ErrAccessDenied, p.Name(), err)
+			}
 			if errors.Is(err, ErrNoCassette) || !retryable(err) {
 				return Result{}, err
 			}

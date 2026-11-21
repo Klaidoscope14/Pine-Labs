@@ -29,7 +29,8 @@ func setup(t *testing.T) *Gateway {
 	os.Symlink(filepath.Join(outside, "secret.txt"), filepath.Join(root, "app", "link.txt"))
 	return &Gateway{Root: root, Writable: true, MaxRead: 4096, MaxCalls: 30, MaxRunTests: 2,
 		Protected: []string{"app/config/payout_auth.py"}, Planned: []string{"app/webhooks/handler.py"}, Adjacent: []string{"tests/**"},
-		RunTests: func(context.Context, string) (string, error) { return "3 passed", nil }}
+		RunTests: func(context.Context, string) (string, error) { return "3 passed", nil },
+		RunLint:  func(context.Context, string) (string, error) { return "All checks passed!", nil }}
 }
 
 func run(g *Gateway, tool string, in map[string]any) Outcome {
@@ -137,5 +138,93 @@ func TestFinishAndConflict(t *testing.T) {
 	}
 	if out := run(g, "raise_conflict", map[string]any{"reason": "needs store.py", "needed_paths": []string{"app/ledger/store.py"}}); !out.Done || out.Conflict == nil {
 		t.Errorf("conflict: %+v", out)
+	}
+}
+
+func TestRunLint(t *testing.T) {
+	g := setup(t)
+	if out := run(g, "run_lint", map[string]any{"path": "app"}); out.IsError || out.Content != "All checks passed!" {
+		t.Fatalf("lint: %+v", out)
+	}
+	if out := run(g, "run_lint", map[string]any{"path": "../outside"}); !out.IsError {
+		t.Error("path escape accepted")
+	}
+}
+
+func TestFinishSelfCheckRefusesThenAccepts(t *testing.T) {
+	g := setup(t)
+	g.MaxFinishRefusals = 2
+	problems := "- lint (ruff) fails:\nS105"
+	g.PreFinish = func(context.Context) string { return problems }
+	in := map[string]any{"summary": "done"}
+	if out := run(g, "finish", in); !out.IsError || out.Done || !strings.Contains(out.Content, "S105") {
+		t.Fatalf("first finish should be refused with the problems: %+v", out)
+	}
+	problems = ""
+	if out := run(g, "finish", in); out.IsError || !out.Done {
+		t.Fatalf("clean finish should be accepted: %+v", out)
+	}
+}
+
+func TestFinishSelfCheckGivesUpAfterLimit(t *testing.T) {
+	g := setup(t)
+	g.MaxFinishRefusals = 1
+	g.PreFinish = func(context.Context) string { return "- tests fail" }
+	if out := run(g, "finish", map[string]any{"summary": "a"}); !out.IsError {
+		t.Fatal("first finish should be refused")
+	}
+	// After the limit the gates judge the change; the loop must not spin forever.
+	if out := run(g, "finish", map[string]any{"summary": "b"}); !out.Done {
+		t.Fatalf("finish after the limit should end the attempt: %+v", out)
+	}
+}
+
+func TestEditReportsDiffNote(t *testing.T) {
+	g := setup(t)
+	g.DiffNote = func(context.Context) string { return "change so far: 2 lines" }
+	run(g, "read_file", map[string]any{"path": "app/webhooks/handler.py"})
+	out := run(g, "edit_file", map[string]any{"path": "app/webhooks/handler.py", "old_text": "return 1", "new_text": "return 2"})
+	if out.IsError || !strings.Contains(out.Content, "change so far: 2 lines") {
+		t.Fatalf("edit should report the diff size: %+v", out)
+	}
+}
+
+func TestEditFilesIsAllOrNothing(t *testing.T) {
+	g := setup(t)
+	run(g, "read_file", map[string]any{"path": "app/webhooks/handler.py"})
+	before, _ := os.ReadFile(filepath.Join(g.Root, "app/webhooks/handler.py"))
+	// Second edit fails (no match), so the first must not be written either.
+	out := run(g, "edit_files", map[string]any{"edits": []map[string]any{
+		{"path": "app/webhooks/handler.py", "old_text": "return 1", "new_text": "return 2"},
+		{"path": "app/webhooks/handler.py", "old_text": "does not exist", "new_text": "x"},
+	}})
+	after, _ := os.ReadFile(filepath.Join(g.Root, "app/webhooks/handler.py"))
+	if !out.IsError || string(before) != string(after) {
+		t.Fatalf("batch with a bad edit must change nothing: %+v", out)
+	}
+	// Edits apply in order against the batch's own result.
+	out = run(g, "edit_files", map[string]any{"edits": []map[string]any{
+		{"path": "app/webhooks/handler.py", "old_text": "return 1", "new_text": "return 2"},
+		{"path": "app/webhooks/handler.py", "old_text": "return 2", "new_text": "return 3"},
+	}})
+	after, _ = os.ReadFile(filepath.Join(g.Root, "app/webhooks/handler.py"))
+	if out.IsError || !strings.Contains(string(after), "return 3") {
+		t.Fatalf("sequential batch failed: %+v %s", out, after)
+	}
+}
+
+func TestEditFilesEnforcesProtectedAndReadRules(t *testing.T) {
+	g := setup(t)
+	run(g, "read_file", map[string]any{"path": "app/webhooks/handler.py"})
+	if out := run(g, "edit_files", map[string]any{"edits": []map[string]any{
+		{"path": "app/webhooks/handler.py", "old_text": "return 1", "new_text": "return 2"},
+		{"path": "app/config/payout_auth.py", "old_text": "THRESHOLD = 10", "new_text": "THRESHOLD = 1"},
+	}}); !out.IsError {
+		t.Fatal("a batch touching a protected file must be refused")
+	}
+	if out := run(g, "edit_files", map[string]any{"edits": []map[string]any{
+		{"path": "tests/test_a.py", "old_text": "pass", "new_text": "assert True"},
+	}}); !out.IsError || !strings.Contains(out.Content, "read") {
+		t.Fatalf("unread file must be refused: %+v", out)
 	}
 }

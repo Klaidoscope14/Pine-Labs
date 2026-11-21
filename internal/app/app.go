@@ -69,6 +69,16 @@ func Settings(cfg *config.Config) workflow.Settings {
 	}
 }
 
+// TaskQueue is the queue a worker serves and runs are sent to. Real-agent
+// workers get one queue per primary provider, so workers for different models
+// can run side by side without picking up each other's runs.
+func TaskQueue(cfg *config.Config) string {
+	if cfg.Agents.Mode == "llm" && len(cfg.LLM.FallbackOrder) > 0 {
+		return cfg.Temporal.TaskQueue + "-" + cfg.LLM.FallbackOrder[0]
+	}
+	return cfg.Temporal.TaskQueue
+}
+
 // WorkflowName is the registered name of the blueprint workflow.
 const WorkflowName = "AegisRun"
 

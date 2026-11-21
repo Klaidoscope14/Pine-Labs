@@ -50,7 +50,12 @@ func main() {
 	}
 	defer c.Close()
 
-	docker := sandbox.Docker{Policy: policy, MaxOutputBytes: cfg.Sandbox.MaxOutputBytes}
+	if err := sandbox.CheckHostFits(cfg.Sandbox); err != nil {
+		log.Error("sandbox limits do not fit this host", "error", err.Error())
+		os.Exit(1)
+	}
+	docker := sandbox.Docker{Policy: policy, MaxOutputBytes: cfg.Sandbox.MaxOutputBytes,
+		Slots: sandbox.NewSlots(cfg.Sandbox.MaxConcurrent)}
 	if n, err := docker.Sweep(ctx); err != nil {
 		log.Warn("sandbox sweep failed", "error", err.Error())
 	} else if n > 0 {
@@ -66,12 +71,12 @@ func main() {
 		Sandbox: docker,
 		Agents:  ag,
 	}
-	w := worker.New(c, cfg.Temporal.TaskQueue, worker.Options{
+	w := worker.New(c, app.TaskQueue(cfg), worker.Options{
 		MaxConcurrentActivityExecutionSize: cfg.Temporal.MaxConcurrentActivities,
 	})
 	w.RegisterWorkflowWithOptions(workflow.Run, tworkflow.RegisterOptions{Name: app.WorkflowName})
 	w.RegisterActivity(acts)
-	log.Info("worker started", "task_queue", cfg.Temporal.TaskQueue, "config_hash", cfg.Hash,
+	log.Info("worker started", "task_queue", app.TaskQueue(cfg), "config_hash", cfg.Hash,
 		"agents", cfg.Agents.Mode, "providers", cfg.LLM.FallbackOrder)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Error("worker stopped", "error", err.Error())

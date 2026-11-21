@@ -14,6 +14,8 @@ type Policy struct {
 	CPUs     float64
 	MemoryMB int
 	PIDs     int
+	// Runtime selects the OCI runtime ("runsc" = gVisor); empty uses Docker's default.
+	Runtime string
 }
 
 // PolicyFromConfig builds a Policy, refusing any networked sandbox.
@@ -21,12 +23,16 @@ func PolicyFromConfig(s config.Sandbox) (Policy, error) {
 	if s.Network != "none" {
 		return Policy{}, fmt.Errorf("sandbox network must be none, got %q", s.Network)
 	}
-	return Policy{CPUs: s.CPUs, MemoryMB: s.MemoryMB, PIDs: s.PIDs}, nil
+	return Policy{CPUs: s.CPUs, MemoryMB: s.MemoryMB, PIDs: s.PIDs, Runtime: s.Runtime}, nil
 }
 
 // Args returns the `docker run` flags for this policy.
 func (p Policy) Args() []string {
-	return []string{
+	var runtime []string
+	if p.Runtime != "" {
+		runtime = []string{"--runtime=" + p.Runtime}
+	}
+	return append(runtime,
 		"--network=none",
 		"--read-only",
 		"--cap-drop=ALL",
@@ -34,13 +40,13 @@ func (p Policy) Args() []string {
 		"--user=10001:10001",
 		"--ipc=private",
 		"--shm-size=64m",
-		"--pids-limit=" + strconv.Itoa(p.PIDs),
-		"--memory=" + strconv.Itoa(p.MemoryMB) + "m",
-		"--memory-swap=" + strconv.Itoa(p.MemoryMB) + "m",
-		"--cpus=" + strconv.FormatFloat(p.CPUs, 'f', -1, 64),
+		"--pids-limit="+strconv.Itoa(p.PIDs),
+		"--memory="+strconv.Itoa(p.MemoryMB)+"m",
+		"--memory-swap="+strconv.Itoa(p.MemoryMB)+"m",
+		"--cpus="+strconv.FormatFloat(p.CPUs, 'f', -1, 64),
 		"--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m",
 		"--env=HOME=/tmp",
-	}
+	)
 }
 
 // HardeningArgs is kept for the aegis-config CLI.

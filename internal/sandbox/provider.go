@@ -53,6 +53,17 @@ type Docker struct {
 	Policy         Policy
 	Binary         string // usually "docker"
 	MaxOutputBytes int64
+	// Slots, if set, caps concurrent sandboxes on this host: Run waits for a free
+	// slot instead of starting another container (a channel, so copies share it).
+	Slots chan struct{}
+}
+
+// NewSlots returns a concurrency limiter for n sandboxes (nil means unlimited).
+func NewSlots(n int) chan struct{} {
+	if n <= 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
 }
 
 var envKey = regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`)
@@ -64,6 +75,14 @@ func (d Docker) Run(ctx context.Context, spec Spec) (Result, error) {
 	}
 	if spec.Timeout <= 0 {
 		return Result{}, errors.New("sandbox: timeout is required")
+	}
+	if d.Slots != nil {
+		select {
+		case d.Slots <- struct{}{}:
+			defer func() { <-d.Slots }()
+		case <-ctx.Done():
+			return Result{}, ctx.Err()
+		}
 	}
 	name := "aegis-sbx-" + randHex(8)
 	args := append([]string{"run", "--name", name, "--label", SandboxLabel}, d.Policy.Args()...)

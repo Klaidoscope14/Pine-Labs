@@ -171,6 +171,12 @@ func Build(ctx context.Context, cfg *config.Config) ([]Provider, error) {
 		switch pc.Kind {
 		case "replay":
 			p = NewReplay(pc.Name, cfg.Path(pc.CassetteDir), pc.Models)
+		case "claude_code":
+			ep, _ := cfg.Endpoint(pc.Endpoint)
+			p = NewClaudeCode(pc.Name, pc.Command, ep.Jurisdiction, pc.Models)
+			if pc.Record {
+				p = &Recorder{Inner: p, Dir: cfg.Path(pc.CassetteDir)}
+			}
 		case "openai_compat":
 			ep, _ := cfg.Endpoint(pc.Endpoint)
 			key, err := config.ResolveSecret(pc.APIKeyRef)

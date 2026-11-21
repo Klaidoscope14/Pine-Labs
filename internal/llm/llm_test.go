@@ -198,3 +198,12 @@ func TestModelGeneratedTextIsNotRescanned(t *testing.T) {
 		t.Fatalf("data we send must still be checked: %v", err)
 	}
 }
+
+func TestAccessDeniedIsTerminal(t *testing.T) {
+	denied := &fakeProvider{name: "a", err: &anthropic.Error{StatusCode: 403}}
+	backup := &fakeProvider{name: "b", msg: okMsg}
+	_, err := router(&fakeLedger{}, denied, backup).Complete(context.Background(), call("x"))
+	if !errors.Is(err, ErrAccessDenied) || backup.calls != 0 {
+		t.Fatalf("err=%v backup calls=%d", err, backup.calls)
+	}
+}

@@ -175,7 +175,7 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 		in := workflow.Input{RunID: res.runID, TenantID: s.Tenant, Repo: repo,
 			Requirement: requirement, Scenario: s.Name,
 			ConfigHash: cfg.Hash, Settings: app.Settings(cfg)}
-		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: res.runID, TaskQueue: cfg.Temporal.TaskQueue},
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: res.runID, TaskQueue: app.TaskQueue(cfg)},
 			app.WorkflowName, in); err != nil {
 			return fail("start: %v", err)
 		}

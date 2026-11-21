@@ -1,0 +1,15 @@
+# AegisSDLC on the AWS instance (PLAN.md §10.4): DeepSeek agents, gVisor sandboxes,
+# limits sized for m7g.2xlarge (8 vCPU / 32 GB). The worker refuses to start if
+# max_concurrent × memory_mb + host_reserve_mb does not fit the host's memory.
+extends: config.deepseek.yaml
+sandbox:
+  runtime: runsc
+  max_concurrent: 16
+  host_reserve_mb: 6144
+gates:
+  parallelism: 6
+llm:
+  roles:
+    # Adaptive effort (PLAN.md §10.5 L10): planning turns and turns after a failure stay
+    # at `high`; routine reads and edits use `low`. Kept only if the benchmark holds.
+    developer: { effort: high, routine_effort: low, max_tokens: 16000 }

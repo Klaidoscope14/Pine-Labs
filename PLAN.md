@@ -330,8 +330,8 @@ This merges the original schedule with the guardrail work (§15) and the scale a
 | 0 | **Foundation** | 0–3 | Repo layout, Docker Compose stack (Postgres, Temporal, NATS, object storage, OpenTelemetry, Jaeger, Prometheus, Grafana, smokescreen), schema-validated config with the jurisdiction check, JSON Schemas for every agent, sample repo `pine-settlements-svc` with the planted webhook bug, hardened sandbox image | See §10.1 exit criteria |
 | 1 | **Deterministic core (no AI yet)** | 3–10 | Sandbox runner, the gates as command-line tools returning JSON (pytest+coverage, ruff, Semgrep FIN-001..006, gitleaks, oasdiff, replay), diff-scope checker, Temporal workflow with stub agents, hash-chained ledger, idempotency keys, `tenant_id` + row-level security, repo mirror cache + worktrees | The full workflow runs end to end on stubbed agent output, and the gates pass or fail correctly on hand-written patches |
 | 2 | **Agents** | 10–18 | LLM router (format checks, repair, fallback, cost, prompt data filter), Analyst, Architect, Developer tool loop, Release, tool gateway, approval signals, kill switch | Demo 1 passes from the command line 5 times in a row |
-| 3 | **Failure handling, guardrails, concurrency** | 18–26 | F1–F6 as tested code paths, GitHub App (draft PR, evidence check, ruleset), FIN-007..014, dependency gate, maker-checker, scope leases, evidence bound to base+head SHA with rebase and re-test, admission control, per-run capability tokens, NATS events | Every failure scenario and guardrail has an automated test |
-| 4 | **Web app, eval and proof** | 26–40 | Next.js web app (intake, live progress, diff, evidence, approve/reject, kill switch, trace links), Grafana dashboards, eval harness (baseline vs. governed, N runs), fake LLM + k6 load test, simulated DR drill, red-team table | The full demo runs from the web app. Eval, load and red-team tables are filled in |
+| 3 | **Failure handling, guardrails, concurrency** | 18–26 | F1–F6 as tested code paths, GitHub App (draft PR, evidence check, ruleset), FIN-007..014, dependency gate, maker-checker, scope leases, evidence bound to base+head SHA with rebase and re-test, admission control, per-run capability tokens, NATS events, **latency design with fixed quality/security invariants (§10.5)** | Every failure scenario and guardrail has an automated test. Median run time is measured per stage and reduced without weakening any invariant |
+| 4 | **Web app, eval and proof** | 26–40 | Next.js web app (intake, live progress, diff, evidence, approve/reject, kill switch, trace links), Grafana dashboards, eval harness (baseline vs. governed, N runs) **including the model benchmark (Claude Sonnet 5.5 via Claude Code, Opus 5 when Bedrock access lands, vs. DeepSeek V4.1 Flash, with cost metrics)**, fake LLM + k6 load test, simulated DR drill, red-team table, **AWS deployment on one hardened EC2 instance (§10.4)** | The full demo runs from the web app, on AWS. Eval, benchmark, load and red-team tables are filled in |
 | 5 | **Should-haves and polish** | 40–44 | Only if on schedule: passkey approvals, OPA policies, merge queue | — |
 | 6 | **Freeze and rehearse** | 44–48 | Code freeze, 3 rehearsals, backup recording, README (architecture, decision records, threat model, real vs. mocked, eval results), slides | Recorded demo and slides ready |
 
@@ -607,6 +607,132 @@ Deviations and additions:
 2. Enable Claude model access in the India region.
 3. Fill in `prices/bedrock-india.yaml`.
 4. Run `make phase2-live`.
+
+**Update:** Opus 5 on Bedrock is blocked by AWS Marketplace payment rules for Indian (AISPL) accounts: card and UPI were both refused, and Bedrock returns `403 INVALID_PAYMENT_INSTRUMENT`. Phase 2's live checks therefore run on **DeepSeek V4.1 Flash** (deploy.com, OpenAI-compatible, under a dev-only residency exception) via `make phase2-live LIVE_CONFIG=config.deepseek.yaml`. The Opus arm follows when access lands; the code path is the same (`config.bedrock.yaml`).
+
+### 10.4 Phase 4 addition: AWS deployment
+
+**Goal:** run the same system on AWS, in an Indian region, so the demo shows it deployed rather than on a laptop. This isn't the full production architecture; that remains the documented path (Kubernetes + gVisor, managed Postgres, Temporal Cloud or a replicated cluster, a DR region in India).
+
+**Billing note:** normal AWS services (EC2, EBS, Systems Manager) are billed by AWS India directly. The Marketplace payment restriction that blocks Claude doesn't apply, and the account's $135 in credits cover them.
+
+#### Design
+| Piece | Choice |
+|---|---|
+| Compute | **One EC2 instance (ARM/Graviton), size from config** (sizing below). Runs the same containers as local: the Compose stack, worker, API and web app |
+| Region | The operator's India region, from config (never hardcoded) |
+| Access | **No SSH, no public ports.** AWS Systems Manager Session Manager for shell access, plus SSM port forwarding to show the web app, Temporal UI and Grafana from a laptop |
+| Identity | Instance IAM role with least privilege: `bedrock:InvokeModel` on the India inference profiles, `bedrock:GetInferenceProfile`, plus its own logs and snapshots. No access keys on the machine; this also stops using the root user for model calls |
+| Secrets | Generated on the instance at first boot (same `secrets.sh`), or stored in SSM Parameter Store as SecureString. Never baked into the image or the IaC |
+| Storage | Encrypted gp3 EBS volume for Postgres, Temporal, the repo mirror and artifacts. Daily EBS snapshots as backups |
+| Sandbox isolation | **gVisor (`runsc`) as the Docker runtime for sandboxes.** EC2 is Linux, so the stronger isolation skipped on macOS becomes available. Selected through config |
+| Egress | Security group allows outbound HTTPS only; smokescreen still restricts the worker to the allow-listed model endpoints. Sandboxes stay network-less |
+| Provisioning | Infrastructure as code (CDK or Terraform) plus a bootstrap script: `make deploy`, `make deploy-stop`, `make deploy-start`, `make deploy-destroy` |
+| Observability | The same OTel → Jaeger + Prometheus → Grafana stack, reached over SSM port forwarding |
+
+#### Sizing: will 4 vCPU / 16 GB be enough?
+Measured on the local stack: the platform itself (Temporal, Postgres, NATS, SeaweedFS, OTel, Jaeger, Prometheus, Grafana, smokescreen) uses **under 1 GB of memory and almost no CPU at idle**. The load comes from sandboxes: each gate run is a container capped at 1 CPU and 1 GB (`sandbox.cpus`, `sandbox.memory_mb`).
+
+**The risk:** nothing currently limits how many sandboxes run at once. The worker allows 16 concurrent activities (`temporal.max_concurrent_activities`), each evaluation runs 3 gates in parallel (`gates.parallelism`), so the worst case is about **48 sandboxes**: 48 CPUs and 48 GB of caps. That would fail on 16 GB (out-of-memory kills, gate infrastructure errors, retries) and crawl on 4 vCPU.
+
+**The fix (built with the deployment):** a global sandbox concurrency limit, `sandbox.max_concurrent`, enforced by the sandbox provider. Extra gate runs wait in a queue instead of overloading the machine. The config guard checks that the limit fits the machine:
+
+`max_concurrent × memory_mb + platform (≈2 GB) + worker/API/web (≈1.5 GB) + OS and headroom (≈2.5 GB) ≤ instance memory`
+
+| Use | Instance (Mumbai price) | `sandbox.max_concurrent` | Verdict |
+|---|---|---|---|
+| Minimum (a few runs at once) | **m7g.xlarge**, 4 vCPU / 16 GB ($0.117/h, ≈ $2.80/day) | 8 (≈8 GB worst case) | **Enough.** About 10 GB worst case in use, 6 GB spare. Runs queue briefly rather than fail |
+| **Chosen:** demo, benchmark and load test | **m7g.2xlarge**, 8 vCPU / 32 GB ($0.233/h, ≈ $5.60/day) | 16 | Comfortable headroom for sustained parallel gates |
+| Avoid | t4g.xlarge (burstable, $0.090/h) | — | Cheaper, but CPU credits run out under sustained gate load, then it throttles |
+
+**Decision:** use **m7g.2xlarge (8 vCPU / 32 GB) with `sandbox.max_concurrent: 16`** for the whole demo period. It costs about $2.80/day more than m7g.xlarge, which is trivial for a short demo window and covered by the $135 in credits. In return, one size handles the demo, benchmark and load test with no resizing, and concurrent runs finish faster (more gates in parallel), which looks better live. m7g.xlarge remains the proven minimum (the sandbox limit makes it safe, just slower under bursts). The instance type is an IaC variable: resizing is stop, change type, start (a few minutes), with no data loss because state lives on the EBS volume. Stop the instance when not demoing: at about $5.60/day running, the credits last well beyond the hackathon.
+
+#### Done when
+1. `make deploy` creates the instance from scratch, and the health checks pass over SSM (same as `make up`).
+2. Demo 1 runs end to end on the instance (replay mode, plus a live provider where access exists), and the ledger and traces are viewable through port forwarding.
+3. Sandboxes run under gVisor, verified by a sandbox reporting the gVisor kernel.
+4. A burst of concurrent runs larger than `sandbox.max_concurrent` completes without out-of-memory kills (queueing visible in metrics).
+5. Nothing listens on a public address; the security group has no inbound rules.
+
+### 10.5 Latency design (DeepSeek production path)
+
+**Goal:** make each run as fast as possible with DeepSeek V4.1 Flash, **without weakening a single quality or security check**. Speed comes from doing less wasted work and from parallelism, never from checking less.
+
+**Measured starting point (Phase 2, DeepSeek):** 6–20 min per run. Almost all of the time goes to Developer turns (20–60 per attempt, 33k–150k output tokens, mostly reasoning) and to retry attempts (a failed attempt repeats the whole loop plus every gate). The pre-finish self-check (Phase 2 follow-up) took live-happy from 0/5 to 3/4 approved: run 1 approved on attempt 1 in about 6 min; runs 3 and 4 also approved; run 2 halted on the file budget (4 files, budget 3); run 5 was cut short when the session ended.
+
+#### What Stripe does (stripe.dev, read 2026-11-22) and what we take from it
+| Stripe practice | Source | AegisSDLC equivalent |
+|---|---|---|
+| **Blueprints:** a state machine in code mixing agent steps with deterministic steps (lint, push), so required steps always run and the model stays boxed in | Minions, parts 1–2 | Already our design: the Temporal workflow is the blueprint. The pre-finish self-check is a deterministic step inside the agent loop |
+| Pre-warmed devboxes, ready in about 10 s, with repo cloned and caches warm | Minions, part 2 | Warm sandbox pool, plus a **repo index per base commit** (tree, import graph, symbols, test map) built once at merge time |
+| Context gathered deterministically **before** the loop; scoped rule files instead of a huge global prompt | Minions, parts 1–2 | Context-rich Developer brief from the repo index; per-directory rules added only when relevant |
+| Shift-left: local lint on every push in under 5 s, cached by a background daemon | Minions, part 2 | Self-check before `finish` (built), with results cached by tree hash |
+| **At most 2 CI rounds, then a human.** More rounds have diminishing returns | Minions, part 2 | `max_ci_rounds: 2` stays. Never raise retries to buy pass rate |
+| Small curated tool set per agent (from about 500 available) | Minions, part 2 | Keep the Developer's tool set small. New tools (`check`, multi-edit) replace turns rather than add choices |
+| Isolation (no production, no internet, QA data only) is what makes unattended runs safe | Minions, part 2 | Network-less, read-only sandboxes, the tool gateway, synthetic data, protected paths |
+| Selective tests by recorded file access; mandatory tests always run; shared-core changes run everything; previously failing tests always rerun; **one full CI run is always kept** | Selective Test Execution | Affected-test selection **only inside the loop**. The final gates always run the full suite and the hidden tests |
+| Only trusted workers may write the build cache (prevents cache poisoning) | Fast builds, secure builds | Gate result cache written only by gate workers, keyed on tree hash, image digest, command and config hash |
+| gVisor's file-system overhead was too slow for import-heavy test suites; moved to Firecracker microVMs | Fast builds, secure builds | Measure gVisor's pytest overhead on AWS. If it's too slow, Firecracker is the documented alternative; isolation is never dropped |
+| Every minion PR is still reviewed by a human | Minions, parts 1–2 | Human approval stays mandatory. Approval wait time is cut with better evidence and summaries, not auto-merge on money paths |
+
+#### Invariants that latency work may never change
+1. The **final verdict** always comes from the full gate set (scope, lint, full test suite with coverage, hidden tests, Semgrep FIN rules, Bandit, gitleaks, dependencies, OpenAPI diff, replay), run on the exact head commit in the hardened sandbox. Nothing is skipped on the path to APPROVED.
+2. Shortcuts may only skip work on an attempt that has **already failed** (fail fast). They never shorten the path to a pass.
+3. **Security gates are never served from cache across different trees.** Cached results are reused only for an identical tree hash, image digest, command and config.
+4. Attempts stay capped (`max_ci_rounds: 2`), then escalate to a human.
+5. Human approval stays mandatory; money and auth paths can never be auto-approved.
+6. The tool gateway's rules (read before edit, scope, protected paths, caps) apply unchanged to every new tool, including parallel and bulk ones.
+7. Budgets, DLP, the kill switch and the audit chain apply to every model call, including hedged duplicates.
+8. A speed change ships only if the benchmark shows **no drop** in approval rate, hidden-test pass rate or security findings.
+
+#### Measures, each with the risk it could pose and the safeguard
+| # | Measure | Expected gain | Quality/security risk | Safeguard |
+|---|---|---|---|---|
+| L1 | **`check` tool** (diff budget + lint + affected tests in one call, run in parallel) replacing separate lint and test turns | fewer turns | none; it's advisory | the final gates still run everything |
+| L2 | **Gate result reuse:** if the self-check already ran ruff or pytest on this exact tree, the gate reuses the result | 30–90 s per attempt | cache poisoning or stale results | key = tree hash + image digest + command + config hash; written only by trusted gate code; lint and tests only, never security gates (invariant 3) |
+| L3 | **Speculative security tier:** start it alongside tier 1, cancel if tier 1 fails | gate time ≈ slowest gate instead of the sum of tiers | none (same checks, same tree) | sandbox concurrency limit (§10.4) caps the CPU cost |
+| L4 | **Fail fast:** after a failing attempt, skip slow gates that would rerun on the fix anyway | minutes per failed attempt | a missed finding on a failed attempt | allowed only on failed attempts (invariant 2); the passing attempt always runs everything |
+| L5 | **Repo index per base commit** (tree, import graph, symbols, test map from coverage), built once per merge | removes per-run analysis | stale index | keyed by base SHA; rebuilt on every base change; read-only for agents |
+| L6 | **Context-rich brief:** planned files, covering tests and relevant snippets put up front | saves 3–8 opening turns | prompt injection via file content | content stays fenced as data, passes through DLP, and the prompt says file content is not instructions (existing rules) |
+| L7 | **Affected-test selection inside the loop only** | seconds per test run | missing a broken test | selection never used by the final gates; on any doubt (shared modules, config, fixtures, conftest) run everything; previously failing tests always run (Stripe's rules) |
+| L8 | **Multi-edit tool** (several edits, all-or-nothing) | fewer turns for mechanical edits | larger unchecked edits | every path checked by the gateway before any write; diff note after the batch; same caps |
+| L9 | **Parallel read-only tool calls** in one turn | fewer round trips | race conditions | read-only tools only; writes stay sequential; gateway counters made thread-safe |
+| L10 | **Adaptive effort:** `high` for planning turns and after a refusal or failure, `low` for routine reads and edits | about 2× fewer reasoning tokens (to measure) | weaker code | gates unchanged, so a weaker change is a retry, never a bad merge; ships only if the benchmark holds (invariant 8); Architect stays `high` |
+| L11 | **Conversation compaction:** old file reads replaced with stubs once a file is edited; test output trimmed to failures | faster first token, lower cost | model edits from a stale memory of a file | when a read is compacted, the gateway clears that file's "read" flag, so an edit requires a fresh read |
+| L12 | **Streaming with early tool dispatch** | a few seconds per turn | acting on a partial reply | dispatch only after a tool call's JSON is complete and validated; read-only tools only |
+| L13 | **Hedged requests** for calls slower than p95 | cuts the slowest tail and covers provider outages | data sent twice; double cost | the second endpoint must pass the same residency check; DLP runs once on the same redacted request; both calls go to the ledger and count against the budget |
+| L14 | **Separate task queues and limits for model work and gate work** | no slot starvation under load | none | per-tenant concurrency caps and a fast lane for small changes keep it fair |
+| L15 | **Per-provider rate limiter** | avoids retry storms after rate-limit errors | none | — |
+| L16 | **Triage lane for small tickets** (one combined planning call) | saves a call and its reasoning | a misjudged "trivial" ticket | the lane can only shorten planning, never gates; protected paths or money keywords force the full lane |
+| L17 | **Warm sandbox pool** | container start-up off the critical path | state leaking between runs | each container used once, then destroyed; pool containers are network-less and read-only like any sandbox |
+| L18 | **Self-hosted DeepSeek in India** (if the weights are open): vLLM or SGLang in ap-south-1 with shared prefix caching | lower latency, no third-party rate limits, data residency restored | GPU cost; new infrastructure to secure | production path only, after the benchmark; private subnet, no public endpoint, same router guards |
+
+#### Order and measurement
+1. **Quick wins (about 1 day):** L1, L2, L3, L4, L10 (behind a benchmark), trimmed test output.
+2. **Fewer turns (2–3 days):** L5, L6, L7, L8, L9, L11.
+3. **Platform (2–3 days):** L12–L17.
+4. **Production path:** L18.
+
+Every step adds Grafana panels for time per stage (planning, Developer turns, tool time, gates, waiting) and per-run output tokens. The benchmark reruns after each step. **Target, to validate:** median run time 3–5 min, down from 6–20 min, with approval rate, hidden-test pass rate and security findings unchanged or better.
+
+#### Status (2026-11-22)
+| # | Status | Notes |
+|---|---|---|
+| L1 `check` tool | **built** | real scope, lint and tests gates in one call; counts against the test-run cap |
+| L2 gate result reuse | **built** | lint/tests cached by tree hash + image digest + config hash; verified offline: final tier 1 reused both (`reused: 1`), scope and every security and tier-2 gate ran fresh |
+| L3 parallel tiers | **built** | all tiers start together; verdict read in tier order, so a hard block is never masked; the retry gets diagnostics from every tier; Temporal version marker keeps older runs replaying unchanged |
+| L4 fail fast | **replaced by L3** | with tiers in parallel there's nothing left to skip; showing every failure at once saves more attempts than skipping gates would |
+| L5 repo index per base | to do | |
+| L6 context-rich brief | **built** | planned files + tests that mention them, capped at a quarter of `max_context_bytes`; only fully included files count as read |
+| L7 affected-test selection | to do | low value on the sample repo (full suite takes seconds); valuable at scale |
+| L8 multi-edit tool | **built** | `edit_files`, all or nothing, every gateway rule checked before any write |
+| L9 parallel read tools | **not doing** | reads are local and instant; the gain is batching reads into one model turn, which the prompt now asks for |
+| L10 adaptive effort | **built, opt-in** | `roles.developer.routine_effort` (on in `config.aws.yaml`); kept only if the benchmark holds |
+| L11 compaction | **not doing for now** | rewriting earlier messages breaks the provider's prompt cache (DeepSeek cached input is about 30× cheaper and faster), so append-only conversations win for loops of 20–60 turns |
+| L12–L16 | to do | |
+| L17 warm sandbox pool | to do | measure gVisor start-up on AWS first |
+| L18 self-hosted DeepSeek | production path | |
+| Sandbox concurrency limit (§10.4) | **built** | `sandbox.max_concurrent`, a host-memory check at worker start, `sandbox.runtime: runsc` (gVisor) |
 
 ---
 

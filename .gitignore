@@ -7,3 +7,7 @@ deploy/compose/.s3.json
 .coverage
 /bin/
 evals/cassettes/**/*.sent.json
+**/.ruff_cache/
+**/.pytest_cache/
+evals/cassettes/recorded/
+.DS_Store

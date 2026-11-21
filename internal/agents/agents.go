@@ -40,6 +40,13 @@ type DevelopInput struct {
 	Plan            json.RawMessage
 	Worktree        string
 	Diagnostics     string // what failed last time, already redacted
+	// BaseSHA is the commit the change is measured against (diff budget).
+	BaseSHA string
+	// BudgetFiles and BudgetLines are the effective diff budget the scope gate enforces.
+	BudgetFiles, BudgetLines int
+	// SelfCheck, if set, runs the real scope, lint and tests gates on the work in
+	// progress and returns their failures ("" when clean). In-process only.
+	SelfCheck func(ctx context.Context) string `json:"-"`
 }
 
 // DevelopOutput is a proposed change, or a design conflict.

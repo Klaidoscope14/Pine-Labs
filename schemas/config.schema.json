@@ -62,6 +62,10 @@
         "max_tokens"
       ],
       "properties": {
+        "routine_effort": {
+          "enum": ["low", "medium", "high", "xhigh", "max"],
+          "description": "Developer only: effort for routine tool turns; planning turns and turns after a failure use effort."
+        },
         "effort": {
           "enum": [
             "low",
@@ -226,10 +230,15 @@
             "required": [
               "name",
               "endpoint",
-              "api_key_ref",
               "models",
               "kind"
             ],
+            "if": {
+              "properties": { "kind": { "const": "claude_code" } }
+            },
+            "else": {
+              "required": ["api_key_ref"]
+            },
             "properties": {
               "name": {
                 "$ref": "#/$defs/name"
@@ -278,8 +287,14 @@
                   "anthropic",
                   "bedrock",
                   "replay",
-                  "openai_compat"
+                  "openai_compat",
+                  "claude_code"
                 ]
+              },
+              "command": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_./-]+$",
+                "description": "kind=claude_code: the Claude Code CLI to run (default \"claude\")."
               },
               "region": {
                 "type": "string",
@@ -484,7 +499,9 @@
         "timeout_seconds",
         "warm_pool_size",
         "network",
-        "max_output_bytes"
+        "max_output_bytes",
+        "max_concurrent",
+        "host_reserve_mb"
       ],
       "properties": {
         "image": {
@@ -509,6 +526,20 @@
         "warm_pool_size": {
           "type": "integer",
           "minimum": 0
+        },
+        "max_concurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Sandboxes running at once on this host; extra runs wait."
+        },
+        "host_reserve_mb": {
+          "type": "integer",
+          "minimum": 1024,
+          "description": "Memory kept for platform, worker and OS when checking max_concurrent fits the host."
+        },
+        "runtime": {
+          "enum": ["", "runc", "runsc"],
+          "description": "OCI runtime for sandboxes. runsc = gVisor (Linux only)."
         },
         "network": {
           "const": "none",
@@ -917,6 +948,12 @@
         "max_run_tests": {
           "type": "integer",
           "minimum": 0
+        },
+        "max_finish_refusals": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 5,
+          "description": "Times the developer's finish is refused while the self-check (diff budget, lint, tests) fails. 0 turns it off."
         },
         "max_context_bytes": {
           "type": "integer",

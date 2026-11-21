@@ -141,11 +141,12 @@ type DecisionInput struct {
 
 // Application error types the workflow maps to terminal states.
 const (
-	ErrAgentRefused  = "AgentRefused"
-	ErrBudget        = "BudgetExceeded"
-	ErrKilled        = "Killed"
-	ErrSensitiveData = "SensitiveData"
-	ErrNeedsHuman    = "NeedsHuman"
+	ErrAgentRefused   = "AgentRefused"
+	ErrBudget         = "BudgetExceeded"
+	ErrKilled         = "Killed"
+	ErrSensitiveData  = "SensitiveData"
+	ErrNeedsHuman     = "NeedsHuman"
+	ErrProviderDenied = "ProviderAccessDenied"
 )
 
 // agentError turns an agent failure into the right Temporal error: terminal
@@ -167,6 +168,8 @@ func agentError(role string, err error) error {
 		return nr(ErrSensitiveData)
 	case errors.Is(err, llm.ErrNoCassette):
 		return nr(ErrScenario)
+	case errors.Is(err, llm.ErrAccessDenied):
+		return nr(ErrProviderDenied)
 	case errors.Is(err, agents.ErrNeedsHuman):
 		return nr(ErrNeedsHuman)
 	case errors.Is(err, llm.ErrUnavailable):
@@ -337,8 +340,15 @@ func (a *Activities) Develop(ctx context.Context, in DevelopActivityInput) (Deve
 		if err := a.WS.ResetClean(ctx, wt); err != nil {
 			return nil, err
 		}
+		var plan planScope
+		if err := json.Unmarshal(in.Plan, &plan); err != nil {
+			return nil, err
+		}
+		budgetFiles, budgetLines := a.diffBudget(plan)
 		out, err := a.Agents.Develop(ctx, agents.DevelopInput{Run: a.agentRun(in.Run, in.Attempt),
-			RequirementSpec: in.Spec, Plan: in.Plan, Worktree: in.Workspace.Path, Diagnostics: in.Diagnostics})
+			RequirementSpec: in.Spec, Plan: in.Plan, Worktree: in.Workspace.Path, Diagnostics: in.Diagnostics,
+			BaseSHA: in.Workspace.BaseSHA, BudgetFiles: budgetFiles, BudgetLines: budgetLines,
+			SelfCheck: a.selfCheck(in.Run, in.Workspace, plan, in.Attempt)})
 		if err != nil {
 			return nil, agentError("developer", err)
 		}
@@ -454,6 +464,19 @@ func blockStatus(gate string) Status {
 	}
 }
 
+// diffBudget is the effective diff budget: the plan may tighten the configured
+// budget, never loosen it.
+func (a *Activities) diffBudget(plan planScope) (files, lines int) {
+	files, lines = a.Cfg.Scope.DiffBudget.Files, a.Cfg.Scope.DiffBudget.Lines
+	if plan.DiffBudget.Files > 0 && plan.DiffBudget.Files < files {
+		files = plan.DiffBudget.Files
+	}
+	if plan.DiffBudget.Lines > 0 && plan.DiffBudget.Lines < lines {
+		lines = plan.DiffBudget.Lines
+	}
+	return files, lines
+}
+
 func (a *Activities) Evaluate(ctx context.Context, in EvalInput) (EvalSummary, error) {
 	defer keepAlive(ctx)()
 	wt := in.Workspace.worktree()
@@ -464,49 +487,24 @@ func (a *Activities) Evaluate(ctx context.Context, in EvalInput) (EvalSummary, e
 	if head != in.HeadSHA {
 		return EvalSummary{}, fmt.Errorf("worktree is at %s, expected %s", head, in.HeadSHA)
 	}
-	base, err := a.baseTree(ctx, wt)
-	if err != nil {
-		return EvalSummary{}, err
-	}
-	changes, err := a.WS.Diff(ctx, wt, wt.BaseSHA, in.HeadSHA)
-	if err != nil {
-		return EvalSummary{}, err
-	}
 	var plan planScope
 	if err := json.Unmarshal(in.Plan, &plan); err != nil {
 		return EvalSummary{}, err
-	}
-	repo, _ := a.Cfg.Repo(in.Run.Repo)
-	// The plan may tighten the configured diff budget, never loosen it.
-	files, lines := a.Cfg.Scope.DiffBudget.Files, a.Cfg.Scope.DiffBudget.Lines
-	if plan.DiffBudget.Files > 0 && plan.DiffBudget.Files < files {
-		files = plan.DiffBudget.Files
-	}
-	if plan.DiffBudget.Lines > 0 && plan.DiffBudget.Lines < lines {
-		lines = plan.DiffBudget.Lines
 	}
 	outRoot := filepath.Join(a.runDir(in.Run.RunID), fmt.Sprintf("attempt-%d", in.Attempt), strings.ToLower(in.Tier))
 	// Every execution (including Temporal retries) gets a fresh scratch directory.
 	// Paths are never deleted and recreated: Docker Desktop's file sharing can keep
 	// seeing a deleted path, and earlier executions' reports are kept as evidence.
 	execDir := filepath.Join(outRoot, fmt.Sprintf("exec-%d-%d", activity.GetInfo(ctx).Attempt, time.Now().UnixNano()))
-	env := gates.Env{
-		Sandbox: a.Sandbox, Image: a.Image,
-		Timeout:   time.Duration(a.Cfg.Sandbox.TimeoutSeconds) * time.Second,
-		MaxOutput: a.Cfg.Sandbox.MaxOutputBytes,
-		Repo:      repo, HeadDir: wt.Path, BaseDir: base, BaseSHA: wt.BaseSHA, HeadSHA: in.HeadSHA,
-		OutRoot:      execDir,
-		BaseCacheDir: filepath.Join(a.Cfg.Path(a.Cfg.Workspace.ArtifactsDir), "base-results", wt.BaseSHA),
-		RulesDir:     a.Cfg.Path(a.Cfg.Gates.SemgrepRulesDir),
-		HiddenDir:    a.Cfg.Path(a.Cfg.Evals.HiddenTestsDir),
-		ReplayDir:    a.Cfg.Path(a.Cfg.Evals.ReplayDir),
-		Changes:      changes,
-		Planned:      plan.Scope.Planned, Adjacent: plan.Scope.Adjacent,
-		Protected:   a.Cfg.Scope.ProtectedPaths,
-		BudgetFiles: files, BudgetLines: lines,
-		InterfaceChangesDeclared: len(plan.InterfaceChanges) > 0,
+	env, err := a.gateEnv(ctx, in.Run, wt, in.HeadSHA, plan, execDir)
+	if err != nil {
+		return EvalSummary{}, err
 	}
-	outcome, err := gaterun.Run(ctx, env, in.Gates, a.Cfg.Gates.Parallelism)
+	tree, err := a.WS.TreeOf(ctx, wt, in.HeadSHA)
+	if err != nil {
+		return EvalSummary{}, err
+	}
+	outcome, err := a.runGates(ctx, env, in.Gates, tree)
 	if err != nil {
 		return EvalSummary{}, err // infrastructure failure: retried, never a pass
 	}
@@ -517,7 +515,14 @@ func (a *Activities) Evaluate(ctx context.Context, in EvalInput) (EvalSummary, e
 	if err := writeJSON(ref, outcome); err != nil {
 		return EvalSummary{}, err
 	}
-	sum := EvalSummary{Verdict: string(outcome.Verdict), ArtifactRef: ref}
+	sum := summarize(outcome)
+	sum.ArtifactRef = ref
+	return sum, nil
+}
+
+// summarize turns a gate outcome into the verdict, block status and diagnostics.
+func summarize(outcome gaterun.Outcome) EvalSummary {
+	sum := EvalSummary{Verdict: string(outcome.Verdict)}
 	var diag []string
 	for _, r := range outcome.Results {
 		sum.Gates = append(sum.Gates, GateBrief{Gate: r.Gate, Verdict: string(r.Verdict), Summary: r.Summary})
@@ -541,7 +546,7 @@ func (a *Activities) Evaluate(ctx context.Context, in EvalInput) (EvalSummary, e
 	if len(sum.Diagnostics) > 2000 {
 		sum.Diagnostics = sum.Diagnostics[:2000] + "\n…"
 	}
-	return sum, nil
+	return sum
 }
 
 func (a *Activities) Release(ctx context.Context, in ReleaseInput) (ReleaseResult, error) {

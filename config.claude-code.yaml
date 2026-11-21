@@ -1,0 +1,11 @@
+# Real agents on Claude Sonnet 5.5 through the local Claude Code CLI (benchmark only;
+# allowed only by the dev residency exception in config.local.yaml). Uses the
+# operator's Claude subscription; costs are recorded at API list price (notional).
+extends: config.local.yaml
+agents:
+  mode: llm
+llm:
+  fallback_order: [claude-code]
+budget:
+  per_run_usd: 5
+  per_tenant_daily_usd: 60
