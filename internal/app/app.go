@@ -3,6 +3,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"os"
@@ -55,18 +57,54 @@ func Workspace(cfg *config.Config) workspace.Manager {
 }
 
 // Settings snapshots the config values a run executes under.
-func Settings(cfg *config.Config) workflow.Settings {
+func Settings(cfg *config.Config, tenant string) workflow.Settings {
 	sandboxTimeout := time.Duration(cfg.Sandbox.TimeoutSeconds) * time.Second
 	// A tier runs each gate on head and (uncached) base; allow for that plus queueing.
 	perTier := len(cfg.Gates.Tier1) + len(cfg.Gates.Security) + len(cfg.Gates.Tier2)
 	rounds := (perTier + cfg.Gates.Parallelism - 1) / cfg.Gates.Parallelism
+	reviewers := 1
+	for _, t := range cfg.Tenants {
+		if t.ID == tenant && t.Reviewers > 0 {
+			reviewers = t.Reviewers
+		}
+	}
+	var freezes []workflow.FreezeWindow
+	for _, f := range cfg.Approval.FreezeWindows {
+		freezes = append(freezes, workflow.FreezeWindow{Start: f.Start, End: f.End, Reason: f.Reason})
+	}
+	orDefault := func(v, d int) time.Duration {
+		if v <= 0 {
+			v = d
+		}
+		return time.Duration(v) * time.Second
+	}
 	return workflow.Settings{
 		MaxCIRounds: cfg.Workflow.MaxCIRounds,
 		Tier1:       cfg.Gates.Tier1, Security: cfg.Gates.Security, Tier2: cfg.Gates.Tier2,
 		ApprovalExpiry:   time.Duration(cfg.Approval.ExpirySeconds) * time.Second,
 		ActivityTimeout:  sandboxTimeout * time.Duration(2*rounds+1),
 		HeartbeatTimeout: time.Duration(cfg.Temporal.HeartbeatSeconds) * time.Second,
+
+		MaxArbitrationRounds: cfg.Workflow.MaxArbitrationRounds,
+		RequiredApprovers:    cfg.Review.RequiredApprovers,
+		FreezeWindows:        freezes,
+		LeaseTTL:             orDefault(cfg.Scope.LeaseTTLSeconds, 1800),
+		LeaseWait:            orDefault(cfg.Scope.LeaseWaitSeconds, 1800),
+		LeasePoll:            15 * time.Second,
+		ReviewWIPCap:         cfg.Review.WIPPerReviewer * reviewers,
+		ReviewPoll:           orDefault(cfg.Review.ReviewPollSeconds, 30),
+		PauseRetry:           orDefault(cfg.LLM.PauseRetrySeconds, 300),
+		MaxRebases:           3,
 	}
+}
+
+// IntakeKey is the idempotent intake key (PLAN.md §16.2): the same requirement
+// for the same tenant and repo, however it is spaced or capitalised, maps to the
+// same run id, so a duplicate submission attaches to the existing run.
+func IntakeKey(tenant, repo, requirement string) string {
+	norm := strings.ToLower(strings.Join(strings.Fields(requirement), " "))
+	sum := sha256.Sum256([]byte(tenant + "\x00" + repo + "\x00" + norm))
+	return "intake-" + hex.EncodeToString(sum[:8])
 }
 
 // TaskQueue is the queue a worker serves and runs are sent to. Real-agent

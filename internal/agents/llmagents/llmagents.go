@@ -331,6 +331,17 @@ type plan struct {
 	} `json:"scope"`
 }
 
+// conflictBrief asks for a revised plan after a Developer design conflict (F1).
+func conflictBrief(conflict string) string {
+	if conflict == "" {
+		return ""
+	}
+	return fence("developer_design_conflict", conflict) +
+		"The Developer could not implement your previous plan within its scope, for the reason above. " +
+		"Revise the plan so it can be implemented (widen the planned or adjacent scope if needed, " +
+		"never into protected paths), or keep it if the conflict is mistaken.\n"
+}
+
 func (a *Agents) Architect(ctx context.Context, in agents.ArchitectInput) (json.RawMessage, error) {
 	s := a.session(in.Run, "architect")
 	files := tree(in.Worktree)
@@ -339,6 +350,7 @@ func (a *Agents) Architect(ctx context.Context, in agents.ArchitectInput) (json.
 		fence("files", strings.Join(files, "\n")) +
 		fence("import_graph", a.importGraph(ctx, in.Worktree, in.Repo)) +
 		fence("source", sourcePack(in.Worktree, files, a.Cfg.Agents.MaxContextBytes)) +
+		conflictBrief(in.Conflict) +
 		"Design the change.")
 	schema, err := contracts.ModelSchema("architecture_plan")
 	if err != nil {

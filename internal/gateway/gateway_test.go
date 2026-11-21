@@ -228,3 +228,11 @@ func TestEditFilesEnforcesProtectedAndReadRules(t *testing.T) {
 		t.Fatalf("unread file must be refused: %+v", out)
 	}
 }
+
+func TestToolConfigWritesRefused(t *testing.T) {
+	g := setup(t)
+	g.Adjacent = append(g.Adjacent, "**")
+	if out := run(g, "create_file", map[string]any{"path": "ruff.toml", "content": "ignore = [\"S\"]\n"}); !out.IsError || !strings.Contains(out.Content, "FIN-014") {
+		t.Fatalf("writing linter config must be refused: %+v", out)
+	}
+}

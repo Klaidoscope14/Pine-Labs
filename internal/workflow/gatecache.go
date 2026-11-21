@@ -176,7 +176,7 @@ func (a *Activities) selfCheck(run Input, ws WorkspaceInfo, plan planScope, atte
 			return ""
 		}
 		names := []string{}
-		for _, g := range []string{"scope", "lint", "tests"} {
+		for _, g := range []string{"scope", "integrity", "lint", "tests"} {
 			if slices.Contains(a.Cfg.Gates.Enabled, g) {
 				names = append(names, g)
 			}

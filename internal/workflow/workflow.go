@@ -6,8 +6,10 @@
 package workflow
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +43,13 @@ const (
 	BudgetExceeded       Status = "BUDGET_EXCEEDED"
 	AgentRefused         Status = "AGENT_REFUSED"
 	ProviderAccessDenied Status = "PROVIDER_ACCESS_DENIED"
+
+	// Phase 3 waiting states (not terminal).
+	WaitingScopeLease    Status = "WAITING_SCOPE_LEASE"
+	QueuedReviewCapacity Status = "QUEUED_REVIEW_CAPACITY"
+	PausedProvider       Status = "PAUSED_PROVIDER"
+	Rebasing             Status = "REBASING"
+	Arbitrating          Status = "ARBITRATING"
 )
 
 // Settings is the config snapshot a run executes under. Passed in at start, so a
@@ -55,18 +64,39 @@ type Settings struct {
 	// HeartbeatTimeout lets Temporal notice a crashed worker quickly and retry
 	// the activity elsewhere, instead of waiting for ActivityTimeout.
 	HeartbeatTimeout time.Duration `json:"heartbeat_timeout"`
+
+	// Phase 3 (PLAN.md §10.6).
+	MaxArbitrationRounds int            `json:"max_arbitration_rounds"`
+	RequiredApprovers    map[string]int `json:"required_approvers"`
+	FreezeWindows        []FreezeWindow `json:"freeze_windows,omitempty"`
+	LeaseTTL             time.Duration  `json:"lease_ttl"`
+	LeaseWait            time.Duration  `json:"lease_wait"`
+	LeasePoll            time.Duration  `json:"lease_poll"`
+	ReviewWIPCap         int            `json:"review_wip_cap"`
+	ReviewPoll           time.Duration  `json:"review_poll"`
+	PauseRetry           time.Duration  `json:"pause_retry"`
+	MaxRebases           int            `json:"max_rebases"`
+}
+
+// FreezeWindow is a change freeze: approvals inside it are refused.
+type FreezeWindow struct {
+	Start  time.Time `json:"start"`
+	End    time.Time `json:"end"`
+	Reason string    `json:"reason"`
 }
 
 // Input starts a run.
 type Input struct {
-	RunID       string   `json:"run_id"`
-	TenantID    string   `json:"tenant_id"`
-	Repo        string   `json:"repo"`
-	BaseRef     string   `json:"base_ref"`
-	Requirement string   `json:"requirement"`
-	Scenario    string   `json:"scenario"`
-	ConfigHash  string   `json:"config_hash"`
-	Settings    Settings `json:"settings"`
+	RunID       string `json:"run_id"`
+	TenantID    string `json:"tenant_id"`
+	Repo        string `json:"repo"`
+	BaseRef     string `json:"base_ref"`
+	Requirement string `json:"requirement"`
+	Scenario    string `json:"scenario"`
+	ConfigHash  string `json:"config_hash"`
+	// Submitter is who asked for the change; maker-checker forbids them approving it.
+	Submitter string   `json:"submitter,omitempty"`
+	Settings  Settings `json:"settings"`
 }
 
 // Decision is the human approval signal.
@@ -97,7 +127,9 @@ type State struct {
 
 const (
 	SignalDecision = "decision"
-	QueryState     = "state"
+	// SignalResume resumes a run paused because its model providers were down (F5).
+	SignalResume = "resume"
+	QueryState   = "state"
 	// ErrContract marks agent output that failed its JSON Schema.
 	ErrContract = "ContractError"
 	// ErrScenario marks a stub/scenario misconfiguration.
@@ -111,6 +143,9 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 	if err := workflow.SetQueryHandler(ctx, QueryState, func() (State, error) { return state, nil }); err != nil {
 		return Outcome{}, err
 	}
+	// Phase 3 behaviour (leases, arbitration, pause/resume, admission control,
+	// maker-checker, rebase on base move). Versioned: older runs replay unchanged.
+	v3 := workflow.GetVersion(ctx, "phase3", workflow.DefaultVersion, 1) == 1
 	actx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: in.Settings.ActivityTimeout,
 		HeartbeatTimeout:    in.Settings.HeartbeatTimeout,
@@ -148,6 +183,9 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 		dctx, _ := workflow.NewDisconnectedContext(actx)
 		if err := record(dctx, "finish", status, out.Attempts, out.HeadSHA, map[string]any{"reason": reason}); err != nil {
 			return out, err
+		}
+		if v3 {
+			_ = workflow.ExecuteActivity(dctx, a.ReleaseLeases, in).Get(dctx, nil)
 		}
 		cleanup()
 		return out, nil
@@ -208,8 +246,43 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 	if err := record(actx, "analyze", Analyzing, 0, "", nil); err != nil {
 		return out, err
 	}
-	var spec AgentOutput
-	if err := workflow.ExecuteActivity(actx, a.Analyze, AgentInput{Run: in, Workspace: ws}).Get(actx, &spec); err != nil {
+	// providerDown reports an agent step that failed because every model provider
+	// stayed unavailable through Temporal's retries.
+	providerDown := func(err error) bool {
+		var appErr *temporal.ApplicationError
+		return errors.As(err, &appErr) && appErr.Type() == ErrProviderUnavailable
+	}
+	// withPause runs an agent step; if the providers are down it pauses the run
+	// (PAUSED_PROVIDER) until a resume signal or the pause interval, then retries
+	// the same step (F5). Without Phase 3 it just runs the step.
+	withPause := func(node string, resume Status, attempt int, step func() error) error {
+		for {
+			err := step()
+			if err == nil || !v3 || !providerDown(err) || canceled(err) {
+				return err
+			}
+			if rerr := record(actx, "pause", PausedProvider, attempt, "", map[string]any{"step": node, "reason": reasonOf(err)}); rerr != nil {
+				return rerr
+			}
+			sel := workflow.NewSelector(ctx)
+			sel.AddReceive(workflow.GetSignalChannel(ctx, SignalResume), func(c workflow.ReceiveChannel, _ bool) {
+				var v any
+				c.Receive(ctx, &v)
+			})
+			tctx, cancelT := workflow.WithCancel(ctx)
+			sel.AddFuture(workflow.NewTimer(tctx, in.Settings.PauseRetry), func(workflow.Future) {})
+			sel.Select(ctx)
+			cancelT()
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if rerr := record(actx, node, resume, attempt, "", map[string]any{"resumed": true}); rerr != nil {
+				return rerr
+			}
+		}
+	}
+	// agentFail maps an agent step error to the run's end.
+	agentFail := func(err error) (Outcome, error) {
 		if contractFailure(err) {
 			st, _ := terminal(err)
 			return finish(st, reasonOf(err))
@@ -218,57 +291,88 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			return finish(Killed, "run was stopped")
 		}
 		return out, err
+	}
+
+	var spec AgentOutput
+	if err := withPause("analyze", Analyzing, 0, func() error {
+		return workflow.ExecuteActivity(actx, a.Analyze, AgentInput{Run: in, Workspace: ws}).Get(actx, &spec)
+	}); err != nil {
+		return agentFail(err)
 	}
 
 	if err := record(actx, "architect", Architecting, 0, "", nil); err != nil {
 		return out, err
 	}
 	var plan AgentOutput
-	if err := workflow.ExecuteActivity(actx, a.Architect, AgentInput{Run: in, Workspace: ws, Prior: spec.JSON}).Get(actx, &plan); err != nil {
-		if contractFailure(err) {
-			st, _ := terminal(err)
-			return finish(st, reasonOf(err))
-		}
-		if canceled(err) {
-			return finish(Killed, "run was stopped")
-		}
-		return out, err
+	architect := func(conflict string, round int) error {
+		return withPause("architect", Architecting, 0, func() error {
+			return workflow.ExecuteActivity(actx, a.Architect, AgentInput{Run: in, Workspace: ws, Prior: spec.JSON,
+				Conflict: conflict, Round: round}).Get(actx, &plan)
+		})
+	}
+	if err := architect("", 0); err != nil {
+		return agentFail(err)
 	}
 
-	diagnostics := ""
-	passed := false
-	for attempt := 1; attempt <= in.Settings.MaxCIRounds; attempt++ {
-		out.Attempts = attempt
-		if err := record(actx, "develop", Developing, attempt, "", nil); err != nil {
-			return out, err
-		}
-		var dev DevelopResult
-		err := workflow.ExecuteActivity(actx, a.Develop, DevelopActivityInput{Run: in, Workspace: ws, Spec: spec.JSON, Plan: plan.JSON,
-			Attempt: attempt, Diagnostics: diagnostics}).Get(actx, &dev)
-		if err != nil {
-			if contractFailure(err) {
-				st, _ := terminal(err)
-				return finish(st, reasonOf(err))
-			}
-			if canceled(err) {
-				return finish(Killed, "run was stopped")
-			}
-			return out, err
-		}
-		if dev.Conflict {
-			return finish(EscalatedHuman, "developer raised a design conflict: "+dev.ConflictReason)
-		}
-		out.HeadSHA = dev.CommitSHA
+	// stop carries an early return out of a helper.
+	type stop struct {
+		out Outcome
+		err error
+	}
+	halt := func(o Outcome, e error) *stop { return &stop{o, e} }
 
+	// P4: scope leases on the planned paths. Waits while another run holds an
+	// overlapping path; escalates after LeaseWait.
+	takeLeases := func(attempt int) *stop {
+		if !v3 {
+			return nil
+		}
+		var ps planScope
+		_ = json.Unmarshal(plan.JSON, &ps)
+		if len(ps.Scope.Planned) == 0 {
+			return nil
+		}
+		var waited time.Duration
+		waiting := false
+		for {
+			var lr LeaseResult
+			if err := workflow.ExecuteActivity(actx, a.AcquireLeases, LeaseInput{Run: in, Paths: ps.Scope.Planned}).Get(actx, &lr); err != nil {
+				if canceled(err) {
+					return halt(finish(Killed, "run was stopped"))
+				}
+				return halt(out, err)
+			}
+			if lr.Granted {
+				return nil
+			}
+			if !waiting {
+				waiting = true
+				if err := record(actx, "lease_wait", WaitingScopeLease, attempt, "", map[string]any{"holder_run": lr.HolderRun, "path": lr.Path}); err != nil {
+					return halt(out, err)
+				}
+			}
+			if waited >= in.Settings.LeaseWait {
+				return halt(finish(EscalatedHuman, fmt.Sprintf("planned path %s is held by run %s (scope lease)", lr.Path, lr.HolderRun)))
+			}
+			if err := workflow.Sleep(ctx, in.Settings.LeasePoll); err != nil {
+				return halt(finish(Killed, "run was stopped while waiting for a scope lease"))
+			}
+			waited += in.Settings.LeasePoll
+		}
+	}
+	if s := takeLeases(0); s != nil {
+		return s.out, s.err
+	}
+
+	// runGates evaluates one commit through every tier.
+	runGates := func(attempt int, head string) (retry bool, diag string, s *stop) {
 		tiers := []struct {
 			status Status
 			gates  []string
 		}{{GatesTier1, in.Settings.Tier1}, {GatesSecurity, in.Settings.Security}, {GatesTier2, in.Settings.Tier2}}
-		retry := false
 		// PLAN.md §10.5 L3: all tiers start together on the same commit; the verdict
 		// is read in tier order, so the result is exactly what sequential tiers would
-		// give, but the developer also gets every failure at once. Versioned so runs
-		// started before this change replay unchanged.
+		// give, but the developer also gets every failure at once.
 		if workflow.GetVersion(ctx, "parallel-gate-tiers", workflow.DefaultVersion, 1) == 1 {
 			var active []struct {
 				status Status
@@ -280,27 +384,27 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 				}
 			}
 			for _, tier := range active {
-				if err := record(actx, "gates", tier.status, attempt, dev.CommitSHA, nil); err != nil {
-					return out, err
+				if err := record(actx, "gates", tier.status, attempt, head, nil); err != nil {
+					return false, "", halt(out, err)
 				}
 			}
 			futures := make([]workflow.Future, len(active))
 			for i, tier := range active {
 				futures[i] = workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
-					HeadSHA: dev.CommitSHA, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates})
+					HeadSHA: head, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates})
 			}
 			var diags []string
 			for i := range active {
 				var ev EvalSummary
 				if err := futures[i].Get(actx, &ev); err != nil {
 					if canceled(err) {
-						return finish(Killed, "run was stopped")
+						return false, "", halt(finish(Killed, "run was stopped"))
 					}
-					return out, err
+					return false, "", halt(out, err)
 				}
 				switch ev.Verdict {
 				case "HARD_BLOCK":
-					return finish(Status(ev.BlockStatus), ev.Reason)
+					return false, "", halt(finish(Status(ev.BlockStatus), ev.Reason))
 				case "REMEDIABLE_FAIL":
 					retry = true
 					if ev.Diagnostics != "" {
@@ -308,87 +412,222 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 					}
 				}
 			}
-			if retry {
-				diagnostics = strings.Join(diags, "\n")
+			return retry, strings.Join(diags, "\n"), nil
+		}
+		for _, tier := range tiers {
+			if len(tier.gates) == 0 {
+				continue
 			}
-		} else {
-			for _, tier := range tiers {
-				if len(tier.gates) == 0 {
-					continue
+			if err := record(actx, "gates", tier.status, attempt, head, nil); err != nil {
+				return false, "", halt(out, err)
+			}
+			var ev EvalSummary
+			err := workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
+				HeadSHA: head, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates}).Get(actx, &ev)
+			if err != nil {
+				if canceled(err) {
+					return false, "", halt(finish(Killed, "run was stopped"))
 				}
-				if err := record(actx, "gates", tier.status, attempt, dev.CommitSHA, nil); err != nil {
+				return false, "", halt(out, err)
+			}
+			switch ev.Verdict {
+			case "HARD_BLOCK":
+				return false, "", halt(finish(Status(ev.BlockStatus), ev.Reason))
+			case "REMEDIABLE_FAIL":
+				return true, ev.Diagnostics, nil
+			}
+		}
+		return false, "", nil
+	}
+
+	diagnostics := ""
+	passed := false
+	arbitration := 0
+	for attempt := 1; attempt <= in.Settings.MaxCIRounds; attempt++ {
+		if attempt > 1 {
+			if s := takeLeases(attempt); s != nil { // renew
+				return s.out, s.err
+			}
+		}
+		out.Attempts = attempt
+		if err := record(actx, "develop", Developing, attempt, "", nil); err != nil {
+			return out, err
+		}
+		var dev DevelopResult
+		if err := withPause("develop", Developing, attempt, func() error {
+			return workflow.ExecuteActivity(actx, a.Develop, DevelopActivityInput{Run: in, Workspace: ws, Spec: spec.JSON, Plan: plan.JSON,
+				Attempt: attempt, Diagnostics: diagnostics, Round: arbitration}).Get(actx, &dev)
+		}); err != nil {
+			return agentFail(err)
+		}
+		if dev.Conflict {
+			// F1: send the conflict back to the Architect for a revised plan.
+			if v3 && arbitration < in.Settings.MaxArbitrationRounds {
+				arbitration++
+				if err := record(actx, "arbitrate", Arbitrating, attempt, "", map[string]any{"conflict": dev.ConflictReason, "round": arbitration}); err != nil {
 					return out, err
 				}
-				var ev EvalSummary
-				err := workflow.ExecuteActivity(actx, a.Evaluate, EvalInput{Run: in, Workspace: ws, Plan: plan.JSON,
-					HeadSHA: dev.CommitSHA, Attempt: attempt, Tier: string(tier.status), Gates: tier.gates}).Get(actx, &ev)
-				if err != nil {
-					if canceled(err) {
-						return finish(Killed, "run was stopped")
-					}
-					return out, err
+				if err := architect(dev.ConflictReason, arbitration); err != nil {
+					return agentFail(err)
 				}
-				switch ev.Verdict {
-				case "HARD_BLOCK":
-					return finish(Status(ev.BlockStatus), ev.Reason)
-				case "REMEDIABLE_FAIL":
-					diagnostics = ev.Diagnostics
-					retry = true
+				if s := takeLeases(attempt); s != nil {
+					return s.out, s.err
 				}
-				if retry {
-					break
-				}
+				diagnostics = ""
+				attempt-- // the revised plan gets a full set of attempts' worth of this round
+				continue
 			}
+			return finish(EscalatedHuman, "developer raised a design conflict: "+dev.ConflictReason)
+		}
+		out.HeadSHA = dev.CommitSHA
+		retry, diag, s := runGates(attempt, dev.CommitSHA)
+		if s != nil {
+			return s.out, s.err
 		}
 		if !retry {
 			passed = true
 			break
 		}
+		diagnostics = diag
 	}
 	if !passed {
 		return finish(HaltedRetryExhausted, fmt.Sprintf("checks still failing after %d attempt(s): %s", out.Attempts, diagnostics))
 	}
 
-	if err := record(actx, "release", Packaging, out.Attempts, out.HeadSHA, nil); err != nil {
-		return out, err
-	}
-	var pkt ReleaseResult
-	if err := workflow.ExecuteActivity(actx, a.Release, ReleaseInput{Run: in, Workspace: ws, Spec: spec.JSON,
-		Plan: plan.JSON, HeadSHA: out.HeadSHA, Attempts: out.Attempts}).Get(actx, &pkt); err != nil {
-		if contractFailure(err) {
-			st, _ := terminal(err)
-			return finish(st, reasonOf(err))
+	rebases := 0
+	for {
+		if err := record(actx, "release", Packaging, out.Attempts, out.HeadSHA, nil); err != nil {
+			return out, err
 		}
-		return out, err
-	}
-	out.EvidenceHash, state.Evidence = pkt.EvidenceHash, pkt.EvidenceHash
+		var pkt ReleaseResult
+		if err := withPause("release", Packaging, out.Attempts, func() error {
+			return workflow.ExecuteActivity(actx, a.Release, ReleaseInput{Run: in, Workspace: ws, Spec: spec.JSON,
+				Plan: plan.JSON, HeadSHA: out.HeadSHA, Attempts: out.Attempts}).Get(actx, &pkt)
+		}); err != nil {
+			return agentFail(err)
+		}
+		out.EvidenceHash, state.Evidence = pkt.EvidenceHash, pkt.EvidenceHash
 
-	if err := record(actx, "await_human", AwaitingHuman, out.Attempts, out.HeadSHA, map[string]any{"evidence_hash": pkt.EvidenceHash}); err != nil {
-		return out, err
+		// P5: don't flood reviewers; park until the tenant's review queue has room.
+		if v3 && in.Settings.ReviewWIPCap > 0 {
+			parked := false
+			for {
+				var n int
+				if err := workflow.ExecuteActivity(actx, a.ReviewLoad, in).Get(actx, &n); err != nil {
+					if canceled(err) {
+						return finish(Killed, "run was stopped")
+					}
+					return out, err
+				}
+				if n < in.Settings.ReviewWIPCap {
+					break
+				}
+				if !parked {
+					parked = true
+					if err := record(actx, "review_queue", QueuedReviewCapacity, out.Attempts, out.HeadSHA, map[string]any{"awaiting": n, "cap": in.Settings.ReviewWIPCap}); err != nil {
+						return out, err
+					}
+				}
+				if err := workflow.Sleep(ctx, in.Settings.ReviewPoll); err != nil {
+					return finish(Killed, "run was stopped while queued for review")
+				}
+			}
+		}
+
+		if err := record(actx, "await_human", AwaitingHuman, out.Attempts, out.HeadSHA, map[string]any{"evidence_hash": pkt.EvidenceHash, "risk_tier": pkt.RiskTier}); err != nil {
+			return out, err
+		}
+		// P3: maker-checker, risk-tiered approver count, freeze windows.
+		need := 1
+		if v3 {
+			if n := in.Settings.RequiredApprovers[pkt.RiskTier]; n > 1 {
+				need = n
+			}
+		}
+		approvers := map[string]bool{}
+		timerCtx, cancelTimer := workflow.WithCancel(ctx)
+		timer := workflow.NewTimer(timerCtx, in.Settings.ApprovalExpiry)
+		decisions := workflow.GetSignalChannel(ctx, SignalDecision)
+		for len(approvers) < need {
+			var decision Decision
+			got, expired := false, false
+			sel := workflow.NewSelector(ctx)
+			sel.AddReceive(decisions, func(c workflow.ReceiveChannel, _ bool) {
+				c.Receive(ctx, &decision)
+				got = true
+			})
+			sel.AddFuture(timer, func(workflow.Future) { expired = true })
+			sel.Select(ctx)
+			if ctx.Err() != nil {
+				cancelTimer()
+				return finish(Killed, "run was stopped while awaiting approval")
+			}
+			if expired && !got {
+				return finish(Expired, "no human decision before the approval expired")
+			}
+			refused := ""
+			if v3 {
+				switch {
+				case decision.Approve && in.Submitter != "" && decision.Reviewer == in.Submitter:
+					refused = "maker-checker: the submitter cannot approve their own change"
+				case decision.Approve && approvers[decision.Reviewer]:
+					refused = "duplicate approval from the same reviewer"
+				case decision.Approve:
+					if w, ok := inFreeze(in.Settings.FreezeWindows, workflow.Now(ctx)); ok {
+						refused = "change freeze in force: " + w.Reason
+					}
+				}
+			}
+			if err := workflow.ExecuteActivity(actx, a.RecordDecision, DecisionInput{Run: in, Decision: decision,
+				HeadSHA: out.HeadSHA, EvidenceHash: out.EvidenceHash, Refused: refused}).Get(actx, nil); err != nil {
+				cancelTimer()
+				return out, err
+			}
+			if refused != "" {
+				continue
+			}
+			if !decision.Approve {
+				cancelTimer()
+				return finish(Rejected, "rejected by "+decision.Reviewer)
+			}
+			approvers[decision.Reviewer] = true
+		}
+		cancelTimer()
+
+		// P9: evidence is bound to (base, head). If the base moved, rebase, re-run
+		// every gate on the new head, and ask for approval again.
+		if v3 && rebases < in.Settings.MaxRebases {
+			var br BaseResult
+			if err := workflow.ExecuteActivity(actx, a.RebaseIfMoved, BaseInput{Run: in, Workspace: ws, HeadSHA: out.HeadSHA, Round: rebases}).Get(actx, &br); err != nil {
+				if canceled(err) {
+					return finish(Killed, "run was stopped")
+				}
+				return out, err
+			}
+			if br.Moved {
+				if br.Conflict {
+					return finish(EscalatedHuman, "the base branch moved and the change no longer rebases cleanly; a human must resolve it")
+				}
+				rebases++
+				ws.BaseSHA, out.BaseSHA, out.HeadSHA = br.BaseSHA, br.BaseSHA, br.HeadSHA
+				if err := record(actx, "rebase", Rebasing, out.Attempts, out.HeadSHA, map[string]any{"new_base": br.BaseSHA, "round": rebases}); err != nil {
+					return out, err
+				}
+				retry, diag, s := runGates(out.Attempts, out.HeadSHA)
+				if s != nil {
+					return s.out, s.err
+				}
+				if retry {
+					return finish(EscalatedHuman, "checks fail after rebasing onto the new base: "+diag)
+				}
+				continue // new evidence; approvals start over
+			}
+		}
+		names := make([]string, 0, len(approvers))
+		for r := range approvers {
+			names = append(names, r)
+		}
+		sort.Strings(names)
+		return finish(Approved, "approved by "+strings.Join(names, ", "))
 	}
-	var decision Decision
-	got, expired := false, false
-	sel := workflow.NewSelector(ctx)
-	sel.AddReceive(workflow.GetSignalChannel(ctx, SignalDecision), func(c workflow.ReceiveChannel, _ bool) {
-		c.Receive(ctx, &decision)
-		got = true
-	})
-	timerCtx, cancelTimer := workflow.WithCancel(ctx)
-	sel.AddFuture(workflow.NewTimer(timerCtx, in.Settings.ApprovalExpiry), func(workflow.Future) { expired = true })
-	sel.Select(ctx)
-	cancelTimer()
-	if ctx.Err() != nil {
-		return finish(Killed, "run was stopped while awaiting approval")
-	}
-	if expired && !got {
-		return finish(Expired, "no human decision before the approval expired")
-	}
-	if err := workflow.ExecuteActivity(actx, a.RecordDecision, DecisionInput{Run: in, Decision: decision,
-		HeadSHA: out.HeadSHA, EvidenceHash: out.EvidenceHash}).Get(actx, nil); err != nil {
-		return out, err
-	}
-	if decision.Approve {
-		return finish(Approved, "approved by "+decision.Reviewer)
-	}
-	return finish(Rejected, "rejected by "+decision.Reviewer)
 }

@@ -1,0 +1,9 @@
+rules:
+  - id: fin-007-rounding
+    languages: [python]
+    severity: ERROR
+    message: "FIN-007: Decimal.quantize() needs an explicit rounding mode (e.g. rounding=ROUND_HALF_UP); the default depends on the global context."
+    metadata: { fin_id: FIN-007, confidence: HIGH }
+    patterns:
+      - pattern: $D.quantize($EXP)
+      - pattern-not: $D.quantize($EXP, rounding=$R)

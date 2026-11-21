@@ -735,7 +735,54 @@ Every step adds Grafana panels for time per stage (planning, Developer turns, to
 | Sandbox concurrency limit (§10.4) | **built** | `sandbox.max_concurrent`, a host-memory check at worker start, `sandbox.runtime: runsc` (gVisor) |
 
 
-### 10.6 Lessons from Razorpay engineering (read 2026-11-22)
+### 10.6 Phase 3 design: failure handling, guardrails, concurrency
+
+**Goal:** every failure scenario (F1–F6) and every "never cut" guardrail is a tested code path, and many concurrent runs on one repo stay correct.
+
+**What already exists from Phases 1–2:**
+- F2: gate failure → diagnostics → retry ≤ 2 → halt
+- F4: schema repair ×2 → FAILED_SCHEMA
+- F6: idempotency keys, loop breaker, scope tiers
+- F3: veto → blocked (signed override not yet built)
+- F1: conflict → escalate (arbitration not yet built)
+- F5: retry + fallback (no pause or resume yet)
+- FIN-001..006, the dependency gate (new package → flagged), DLP, kill switch, budgets, RLS, the hash chain
+
+#### Scope (built in this phase)
+| # | Item | Design | Never cut? |
+|---|---|---|---|
+| P1 | **Integrity gate (FIN-013 test tampering, FIN-014 silencing scanners)** | A new deterministic gate (Go, base vs. head, tier 1). **Hard block → human:** an existing test file deleted, an existing test function removed, a skip/xfail added, or an existing test function losing asserts; edits to linter, test, coverage, scanner or CI config. **Must fix:** new suppression comments (`noqa`, `nosec`, `nosemgrep`, `type: ignore`, `pragma: no cover`, `pylint: disable`) | yes |
+| P2 | **Semgrep FIN-007 / 009 / 011 / 012** | 007 bare `quantize()` without a rounding mode; 009 naive `datetime.now()` / `utcnow()`; 011 webhook signature compared with `==` instead of `hmac.compare_digest`; 012 new FastAPI route without an auth dependency. Each has positive and negative fixtures (`make semgrep-test`) | 011/012 sit on the demo ticket |
+| P3 | **Maker-checker + risk-tiered approvals + freeze windows** | The submitter is recorded on the run and can never approve it. The tier is computed at release: `high` if any changed file matches `review.high_risk_paths`, an adjacent file changed, or a dependency changed; else `low`. The run waits for `review.required_approvers[tier]` **distinct** approvers; any rejection rejects. Approvals during an `approval.freeze_windows` entry are refused (audited). Maps to PCI DSS 6.2.3.1 | yes |
+| P4 | **Scope leases** | After the Architect plans, the run takes a TTL lease on its planned paths (`scope_leases` table, RLS). If another live run holds an overlapping path, the run waits (`WAITING_SCOPE_LEASE`) and retries; after `scope.lease_wait_seconds` it escalates. Leases are renewed per attempt and released on finish | yes |
+| P5 | **Admission control (review WIP)** | Before asking for approval: if the tenant already has `review.wip_per_reviewer × reviewers` runs awaiting review, the run parks at `QUEUED_REVIEW_CAPACITY` and rechecks on a timer. Work isn't lost; reviewers aren't flooded | |
+| P6 | **Idempotent intake** | Intake key = hash(tenant, repo, normalised requirement); a duplicate submission attaches to the existing run (opt-in `-dedupe` for the CLI; the default for the Phase 4 API) | |
+| P7 | **F1 arbitration** | A Developer `DESIGN_CONFLICT` goes back to the Architect with the conflict (`workflow.max_arbitration_rounds`, default 1); a revised plan goes to the Developer; otherwise escalate | |
+| P8 | **F5 pause and resume** | When the providers are still unavailable after Temporal's retries, the run moves to `PAUSED_PROVIDER` (it doesn't fail), waits for a `resume` signal or `llm.pause_retry_seconds`, then retries the same step | |
+| P9 | **Base moved: rebase and re-test** | When approval arrives (and before asking for it), the worker checks whether the base branch moved. If so, it rebases the run branch onto the new tip and re-runs every gate. The evidence hash is rebuilt over the new (base, head), and a fresh approval is required. A rebase conflict escalates to a human | yes (SHA-bound gate) |
+| P10 | **Ledger reconcile (Phase 2 bug)** | `aegis-ctl reconcile` (also run after `kill`): every run the ledger says is active but whose Temporal workflow is closed gets its real final status (or KILLED), with an audit event | |
+
+#### Deferred (with reasons)
+- **GitHub App** (draft PR, evidence check run, ruleset): needs an App registered on your GitHub account (App ID, private key, installation). The code-host interface is ready; setup steps are in the README checklist.
+- **Per-run capability JWTs:** the gateway runs in-process with the agent, so a token would duplicate checks the gateway already enforces. This becomes worthwhile when tools move to a separate service.
+- **NATS run events:** they feed the Phase 4 web app's live view, so they're built with it.
+- **FIN-010** (retry without an idempotency key): too fuzzy for a reliable Semgrep rule; Bandit B113 (no timeout) is the enforceable part.
+- **F3 signed override, coverage-drop check:** Phase 5 should-haves.
+
+#### Status (2026-11-22): P1–P10 built and tested
+- **Unit tests:** integrity gate (6 tampering cases, suppression, config, pyproject); workflow (maker-checker, two approvers for high risk, duplicate approvals, submitter withdrawal, freeze window, lease wait and escalation, arbitration, pause/resume, review capacity, rebase and rebase conflict); ledger against Postgres (leases incl. RLS and expiry, review load, reconcile, migration idempotency); intake key; gateway FIN-014 refusal.
+- **Semgrep:** `make semgrep-test` passes 8/8, including the new FIN-007/009/011/012.
+- **End to end:** run-all (6 scenarios concurrently, correct end states, chains verified), crash test, and the offline Phase 2 check all pass.
+- **Two-run lease demo:** the second run went `ARCHITECTING → WAITING_SCOPE_LEASE → DEVELOPING` and both were approved.
+- **The AWS box is labelled `staging`:** the config guard refuses the DeepSeek (US) endpoint in `production`, as designed. Production needs an India-hosted model.
+
+#### Done when
+- Unit tests cover every new path (integrity rules, leases, tiers, maker-checker, freeze, pause/resume, arbitration, base-moved rebase).
+- `make semgrep-test` passes with the new rules.
+- `make phase1` and `make phase2-offline` still pass.
+- A two-run lease conflict is demonstrated.
+
+### 10.7 Lessons from Razorpay engineering (read 2026-11-22)
 Razorpay runs payments at Indian scale on Go, AWS and Kubernetes, so their engineering blog is a close match for our stack and regulator. These are the ideas worth adopting, each tied to its post:
 
 | # | Idea | Source post | Where it lands |

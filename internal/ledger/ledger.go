@@ -145,19 +145,20 @@ type Run struct {
 	Status      string `json:"status"`
 	Attempts    int    `json:"attempts"`
 	ConfigHash  string `json:"config_hash"`
+	Submitter   string `json:"submitter,omitempty"`
 }
 
 // CreateRun inserts a run once; retries are no-ops.
 func (s *Store) CreateRun(ctx context.Context, r Run) error {
 	return s.tx(ctx, r.TenantID, func(tx pgx.Tx) error {
-		tag, err := tx.Exec(ctx, `INSERT INTO runs (run_id, tenant_id, scenario, repo, requirement, status, config_hash)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (run_id) DO NOTHING`,
-			r.RunID, r.TenantID, r.Scenario, r.Repo, r.Requirement, r.Status, r.ConfigHash)
+		tag, err := tx.Exec(ctx, `INSERT INTO runs (run_id, tenant_id, scenario, repo, requirement, status, config_hash, submitter)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (run_id) DO NOTHING`,
+			r.RunID, r.TenantID, r.Scenario, r.Repo, r.Requirement, r.Status, r.ConfigHash, r.Submitter)
 		if err != nil || tag.RowsAffected() == 0 {
 			return err
 		}
 		return appendAudit(ctx, tx, r.TenantID, r.RunID, "run.created", map[string]any{
-			"repo": r.Repo, "scenario": r.Scenario, "config_hash": r.ConfigHash})
+			"repo": r.Repo, "scenario": r.Scenario, "config_hash": r.ConfigHash, "submitter": r.Submitter})
 	})
 }
 

@@ -1,0 +1,13 @@
+rules:
+  - id: fin-009-naive-datetime
+    languages: [python]
+    severity: ERROR
+    message: "FIN-009: naive datetime. Settlement and cut-off maths must be timezone-aware (datetime.now(tz=...) with an explicit zone such as Asia/Kolkata or UTC)."
+    metadata: { fin_id: FIN-009, confidence: HIGH }
+    pattern-either:
+      - pattern: datetime.utcnow()
+      - pattern: datetime.datetime.utcnow()
+      - pattern: datetime.now()
+      - pattern: datetime.datetime.now()
+      - pattern: datetime.today()
+      - pattern: datetime.datetime.today()

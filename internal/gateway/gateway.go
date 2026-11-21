@@ -30,6 +30,7 @@ import (
 	"github.com/bmatcuk/doublestar/v4"
 
 	"aegis/internal/dlp"
+	"aegis/internal/gates"
 )
 
 // Call is one audited tool invocation.
@@ -180,6 +181,9 @@ func (g *Gateway) canWrite(rel string) error {
 	}
 	if match(g.Protected, rel) {
 		return fmt.Errorf("%w: %s may never be modified by an agent", ErrProtected, rel)
+	}
+	if gates.IsToolConfig(rel) {
+		return fmt.Errorf("FIN-014: %s configures the linters, tests or scanners; agents may not change it (fix the code instead)", rel)
 	}
 	if !match(g.Planned, rel) && !match(g.Adjacent, rel) {
 		return fmt.Errorf("%s is outside the planned scope; if the change truly needs it, call raise_conflict", rel)

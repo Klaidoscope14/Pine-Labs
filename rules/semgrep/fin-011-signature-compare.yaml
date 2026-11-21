@@ -1,0 +1,29 @@
+rules:
+  - id: fin-011-signature-compare
+    languages: [python]
+    severity: ERROR
+    message: "FIN-011: compare signatures, HMACs and tokens with hmac.compare_digest (constant time), never == or !=; a timing side channel leaks the expected value."
+    metadata: { fin_id: FIN-011, confidence: HIGH }
+    patterns:
+      - pattern-either:
+          - pattern: $A == $B
+          - pattern: $A != $B
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: $A == $B
+                  - pattern: $A != $B
+              - metavariable-regex:
+                  metavariable: $A
+                  regex: (?i).*(signature|sig\b|hmac|digest|mac\b|token).*
+          - patterns:
+              - pattern-either:
+                  - pattern: $A == $B
+                  - pattern: $A != $B
+              - metavariable-regex:
+                  metavariable: $B
+                  regex: (?i).*(signature|sig\b|hmac|digest|mac\b|token).*
+      - pattern-not: $A == None
+      - pattern-not: $A != None
+      - pattern-not: $A == ""
+      - pattern-not: $A != ""

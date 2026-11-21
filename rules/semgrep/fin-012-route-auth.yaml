@@ -1,0 +1,32 @@
+rules:
+  - id: fin-012-route-auth
+    languages: [python]
+    severity: WARNING
+    message: "FIN-012: this route has no authentication dependency (Depends(require_*/get_current_*/verify_*)) and no signature check. Confirm it is meant to be public; reviewers must see this."
+    metadata: { fin_id: FIN-012, confidence: MEDIUM }
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$R.$M(...)
+              def $F(...):
+                  ...
+          - pattern: |
+              @$R.$M(...)
+              async def $F(...):
+                  ...
+      - metavariable-regex:
+          metavariable: $M
+          regex: ^(get|post|put|patch|delete)$
+      - pattern-not: |
+          @$R.$M(..., dependencies=[...], ...)
+          def $F(...):
+              ...
+      - pattern-not: |
+          @$R.$M(..., dependencies=[...], ...)
+          async def $F(...):
+              ...
+      - pattern-not-regex: (?i)Depends\(\s*(require_|get_current_|verify_|auth)
+      - pattern-not-regex: compare_digest|verify_signature
+      - metavariable-regex:
+          metavariable: $F
+          regex: ^(?!(healthz|health|readyz|livez|metrics)$).*

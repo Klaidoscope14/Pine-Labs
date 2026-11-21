@@ -2,6 +2,13 @@
 # limits sized for m7g.2xlarge (8 vCPU / 32 GB). The worker refuses to start if
 # max_concurrent × memory_mb + host_reserve_mb does not fit the host's memory.
 extends: config.deepseek.yaml
+# "staging", not "production": DeepSeek via deploy.com is outside India and allowed
+# only by a residency exception, which the config guard refuses in production.
+# Production needs an India-hosted model endpoint (PLAN.md §10.5 L18 or Bedrock India).
+deployment:
+  environment: staging
+  primary_region: ap-south-1
+  dr_region: ap-south-2
 sandbox:
   runtime: runsc
   max_concurrent: 16

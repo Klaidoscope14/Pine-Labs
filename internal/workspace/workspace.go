@@ -236,6 +236,23 @@ func (m Manager) Snapshot(ctx context.Context, wt Worktree) (commit, tree string
 	return strings.TrimSpace(out), tree, nil
 }
 
+// Rebase replays the run branch's commits onto newBase. On a conflict the rebase
+// is aborted, the worktree is left as it was, and conflict is true.
+func (m Manager) Rebase(ctx context.Context, wt Worktree, newBase string) (head string, conflict bool, err error) {
+	if !shaLike.MatchString(newBase) {
+		return "", false, fmt.Errorf("invalid base sha")
+	}
+	if _, err := m.git(ctx, wt.Path, "rebase", "--onto", newBase, wt.BaseSHA); err != nil {
+		_, _ = m.git(ctx, wt.Path, "rebase", "--abort")
+		if strings.Contains(err.Error(), "CONFLICT") || strings.Contains(err.Error(), "could not apply") {
+			return "", true, nil
+		}
+		return "", false, err
+	}
+	head, err = m.Head(ctx, wt)
+	return head, false, err
+}
+
 // TreeOf returns the tree hash of a commit (identical content gives an identical hash).
 func (m Manager) TreeOf(ctx context.Context, wt Worktree, commit string) (string, error) {
 	out, err := m.git(ctx, wt.Path, "rev-parse", commit+"^{tree}")

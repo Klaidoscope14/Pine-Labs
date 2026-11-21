@@ -108,7 +108,7 @@ approval: { expiry_seconds: 86400 }
 api: { listen: "127.0.0.1:8480" }
 gates:
   enabled: [scope, lint, tests]
-  tier1: [scope, lint, tests]
+  tier1: [scope, integrity, lint, tests]
   security: [semgrep, bandit, secrets, dependencies]
   tier2: [hidden_tests, openapi, replay]
   parallelism: 3

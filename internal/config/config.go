@@ -98,6 +98,8 @@ type LLM struct {
 	FallbackOrder []string                `json:"fallback_order"`
 	Roles         map[string]RoleSettings `json:"roles"`
 	MaxRetries    int                     `json:"max_retries"`
+	// PauseRetrySeconds: F5 pause length before a paused run retries its step.
+	PauseRetrySeconds int `json:"pause_retry_seconds,omitempty"`
 }
 
 type Provider struct {
@@ -158,12 +160,15 @@ type Budget struct {
 type Review struct {
 	WIPPerReviewer    int            `json:"wip_per_reviewer"`
 	RequiredApprovers map[string]int `json:"required_approvers"`
+	HighRiskPaths     []string       `json:"high_risk_paths,omitempty"`
+	ReviewPollSeconds int            `json:"review_poll_seconds,omitempty"`
 }
 
 type Scope struct {
-	ProtectedPaths  []string   `json:"protected_paths"`
-	DiffBudget      DiffBudget `json:"diff_budget"`
-	LeaseTTLSeconds int        `json:"lease_ttl_seconds"`
+	ProtectedPaths   []string   `json:"protected_paths"`
+	DiffBudget       DiffBudget `json:"diff_budget"`
+	LeaseTTLSeconds  int        `json:"lease_ttl_seconds"`
+	LeaseWaitSeconds int        `json:"lease_wait_seconds,omitempty"`
 }
 
 type DiffBudget struct {
@@ -194,6 +199,7 @@ type Tenant struct {
 	Concurrency   int     `json:"concurrency"`
 	QueuePriority string  `json:"queue_priority"`
 	DailyUSD      float64 `json:"daily_usd"`
+	Reviewers     int     `json:"reviewers,omitempty"`
 }
 
 type Tokens struct {
@@ -201,7 +207,15 @@ type Tokens struct {
 }
 
 type Approval struct {
-	ExpirySeconds int `json:"expiry_seconds"`
+	ExpirySeconds int            `json:"expiry_seconds"`
+	FreezeWindows []FreezeWindow `json:"freeze_windows,omitempty"`
+}
+
+// FreezeWindow is a change freeze: approvals are refused between Start and End.
+type FreezeWindow struct {
+	Start  time.Time `json:"start"`
+	End    time.Time `json:"end"`
+	Reason string    `json:"reason"`
 }
 
 type API struct {

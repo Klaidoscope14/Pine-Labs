@@ -31,6 +31,9 @@ type ArchitectInput struct {
 	Run
 	RequirementSpec json.RawMessage
 	Worktree        string // read-only for the Architect
+	// Conflict is a Developer design conflict from the previous plan (F1
+	// arbitration): the Architect must re-plan around it or keep the plan.
+	Conflict string
 }
 
 // DevelopInput is the Developer's input.

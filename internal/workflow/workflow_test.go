@@ -43,7 +43,9 @@ func newHarness(t *testing.T, skip ...string) *harness {
 	if !skipped["CreateRun"] {
 		h.env.OnActivity(h.a.CreateRun, mock.Anything, mock.Anything).Return(nil)
 	}
-	h.env.OnActivity(h.a.RecordTransition, mock.Anything, mock.Anything).Return(nil)
+	if !skipped["RecordTransition"] {
+		h.env.OnActivity(h.a.RecordTransition, mock.Anything, mock.Anything).Return(nil)
+	}
 	h.env.OnActivity(h.a.Prepare, mock.Anything, mock.Anything).Return(WorkspaceInfo{RunID: "r1", Path: "/w", Branch: "agent/run-r1", BaseSHA: "base"}, nil)
 	if !skipped["Analyze"] {
 		h.env.OnActivity(h.a.Analyze, mock.Anything, mock.Anything).Return(AgentOutput{JSON: json.RawMessage(`{}`)}, nil)
@@ -51,8 +53,22 @@ func newHarness(t *testing.T, skip ...string) *harness {
 	if !skipped["Architect"] {
 		h.env.OnActivity(h.a.Architect, mock.Anything, mock.Anything).Return(AgentOutput{JSON: json.RawMessage(`{}`)}, nil)
 	}
-	h.env.OnActivity(h.a.Release, mock.Anything, mock.Anything).Return(ReleaseResult{EvidenceHash: "ev"}, nil)
-	h.env.OnActivity(h.a.RecordDecision, mock.Anything, mock.Anything).Return(nil)
+	if !skipped["Release"] {
+		h.env.OnActivity(h.a.Release, mock.Anything, mock.Anything).Return(ReleaseResult{EvidenceHash: "ev"}, nil)
+	}
+	if !skipped["RecordDecision"] {
+		h.env.OnActivity(h.a.RecordDecision, mock.Anything, mock.Anything).Return(nil)
+	}
+	if !skipped["AcquireLeases"] {
+		h.env.OnActivity(h.a.AcquireLeases, mock.Anything, mock.Anything).Return(LeaseResult{Granted: true}, nil)
+	}
+	h.env.OnActivity(h.a.ReleaseLeases, mock.Anything, mock.Anything).Return(nil)
+	if !skipped["ReviewLoad"] {
+		h.env.OnActivity(h.a.ReviewLoad, mock.Anything, mock.Anything).Return(0, nil)
+	}
+	if !skipped["RebaseIfMoved"] {
+		h.env.OnActivity(h.a.RebaseIfMoved, mock.Anything, mock.Anything).Return(BaseResult{}, nil)
+	}
 	h.env.OnActivity(h.a.Cleanup, mock.Anything, mock.Anything).Return(nil)
 	return h
 }
@@ -86,7 +102,12 @@ func (h *harness) approveAfter(d time.Duration, approve bool) {
 
 func (h *harness) run(t *testing.T) Outcome {
 	t.Helper()
-	h.env.ExecuteWorkflow(Run, input())
+	return h.runWith(t, input())
+}
+
+func (h *harness) runWith(t *testing.T, in Input) Outcome {
+	t.Helper()
+	h.env.ExecuteWorkflow(Run, in)
 	if !h.env.IsWorkflowCompleted() {
 		t.Fatal("workflow did not complete")
 	}

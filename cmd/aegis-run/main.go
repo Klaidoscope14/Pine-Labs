@@ -22,6 +22,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 
 	"aegis/internal/app"
@@ -45,6 +46,7 @@ func main() {
 	detach := flag.Bool("detach", false, "start the run, print its id, and exit")
 	follow := flag.String("follow", "", "follow an existing run id instead of starting one")
 	timeout := flag.Duration("timeout", 30*time.Minute, "overall timeout")
+	dedupe := flag.Bool("dedupe", false, "idempotent intake: a repeat of the same requirement attaches to the existing run")
 	flag.Parse()
 	log := app.Logger()
 	cfg, err := config.LoadFile(*path)
@@ -103,7 +105,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := runOne(ctx, cfg, c, store, s, *follow, *detach, reviewer)
+			r := runOne(ctx, cfg, c, store, s, *follow, *detach, *dedupe, reviewer)
 			mu.Lock()
 			results = append(results, r)
 			mu.Unlock()
@@ -152,6 +154,10 @@ func main() {
 	}
 }
 
+// submitterOf names the simulated requester; reviewers are distinct identities,
+// so maker-checker (submitter != approver) holds in scenario runs.
+func submitterOf(reviewer string) string { return "requester:" + reviewer }
+
 func newRunID(s string) string {
 	b := make([]byte, 4)
 	_, _ = rand.Read(b)
@@ -159,7 +165,7 @@ func newRunID(s string) string {
 }
 
 func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *ledger.Store, s scenario.Scenario,
-	follow string, detach bool, reviewer string) result {
+	follow string, detach, dedupe bool, reviewer string) result {
 	res := result{scenario: s.Name, tenant: s.Tenant}
 	fail := func(format string, args ...any) result {
 		res.problems = append(res.problems, fmt.Sprintf(format, args...))
@@ -172,10 +178,18 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 			return fail("read requirement: %v", err)
 		}
 		res.runID = newRunID(s.Name)
+		if dedupe {
+			res.runID = app.IntakeKey(s.Tenant, repo, requirement)
+		}
 		in := workflow.Input{RunID: res.runID, TenantID: s.Tenant, Repo: repo,
-			Requirement: requirement, Scenario: s.Name,
-			ConfigHash: cfg.Hash, Settings: app.Settings(cfg)}
-		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: res.runID, TaskQueue: app.TaskQueue(cfg)},
+			Requirement: requirement, Scenario: s.Name, Submitter: submitterOf(reviewer),
+			ConfigHash: cfg.Hash, Settings: app.Settings(cfg, s.Tenant)}
+		opts := client.StartWorkflowOptions{ID: res.runID, TaskQueue: app.TaskQueue(cfg)}
+		if dedupe {
+			// A duplicate submission attaches to the run already in progress.
+			opts.WorkflowIDConflictPolicy = enums.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING
+		}
+		if _, err := c.ExecuteWorkflow(ctx, opts,
 			app.WorkflowName, in); err != nil {
 			return fail("start: %v", err)
 		}
@@ -187,22 +201,27 @@ func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *led
 		res.runID = follow
 	}
 
-	// Act as the human reviewer when the scenario says to approve.
-	signaled := false
+	// Act as the human reviewers when the scenario says to approve. High-risk
+	// changes need several distinct approvers (maker-checker), so while the run
+	// still awaits a decision, another simulated reviewer signs off.
+	signaled := 0
+	var lastSignal time.Time
 	for {
 		resp, err := c.QueryWorkflow(ctx, res.runID, "", workflow.QueryState)
 		var st workflow.State
 		if err == nil && resp.Get(&st) == nil {
-			if st.Status == workflow.AwaitingHuman && !signaled {
+			due := signaled == 0 || (s.Approve && time.Since(lastSignal) > 2*time.Second && signaled < 5)
+			if st.Status == workflow.AwaitingHuman && due {
 				note := "scenario auto-approval"
 				if !s.Approve {
 					note = "scenario auto-rejection"
 				}
 				if err := c.SignalWorkflow(ctx, res.runID, "", workflow.SignalDecision,
-					workflow.Decision{Approve: s.Approve, Reviewer: reviewer, Note: note}); err != nil {
+					workflow.Decision{Approve: s.Approve, Reviewer: fmt.Sprintf("%s#%d", reviewer, signaled+1), Note: note}); err != nil {
 					return fail("signal: %v", err)
 				}
-				signaled = true
+				signaled++
+				lastSignal = time.Now()
 			}
 		}
 		desc, err := c.DescribeWorkflowExecution(ctx, res.runID, "")

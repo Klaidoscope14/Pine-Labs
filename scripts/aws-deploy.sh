@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Deploys AegisSDLC to one EC2 instance (PLAN.md §10.4) and starts the stack.
-#   usage: AWS_REGION=<region> [AWS_PROFILE=<profile>] [INSTANCE_TYPE=m7g.2xlarge] scripts/aws-deploy.sh
+#   usage: AWS_REGION=<region> [AWS_PROFILE=<profile>] [INSTANCE_TYPE=m7g.2xlarge] [SKIP_STACK=1] scripts/aws-deploy.sh
+#   SKIP_STACK=1 ships code only (no CloudFormation update, so no instance stop/start).
 # Needs: aws CLI v2 signed in. Nothing listens publicly; use scripts/aws-tunnel.sh to view UIs.
 # The model API key must already be in SSM: see the "put the key" command printed below.
 set -euo pipefail
@@ -16,9 +17,11 @@ if ! aws_ ssm get-parameter --name /aegis/deploy-api-key --query Parameter.Name 
   exit 1
 fi
 
-echo "== stack $stack ($itype) in $AWS_REGION"
-aws_ cloudformation deploy --stack-name "$stack" --template-file "$root/deploy/aws/aegis.cfn.yaml" \
-  --capabilities CAPABILITY_IAM --parameter-overrides "InstanceType=$itype" --no-fail-on-empty-changeset
+if [[ "${SKIP_STACK:-0}" != 1 ]]; then
+  echo "== stack $stack ($itype) in $AWS_REGION"
+  aws_ cloudformation deploy --stack-name "$stack" --template-file "$root/deploy/aws/aegis.cfn.yaml" \
+    --capabilities CAPABILITY_IAM --parameter-overrides "InstanceType=$itype" --no-fail-on-empty-changeset
+fi
 out() { aws_ cloudformation describe-stacks --stack-name "$stack" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
 instance="$(out InstanceId)"; bucket="$(out BundleBucket)"
 

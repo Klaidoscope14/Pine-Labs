@@ -70,6 +70,10 @@ type AgentInput struct {
 	Run       Input           `json:"run"`
 	Workspace WorkspaceInfo   `json:"workspace"`
 	Prior     json.RawMessage `json:"prior,omitempty"`
+	// Conflict, for the Architect, is a Developer design conflict to re-plan around (F1).
+	Conflict string `json:"conflict,omitempty"`
+	// Round numbers re-plans so each gets its own idempotency key.
+	Round int `json:"round,omitempty"`
 }
 
 type AgentOutput struct {
@@ -83,6 +87,8 @@ type DevelopActivityInput struct {
 	Plan        json.RawMessage `json:"plan"`
 	Attempt     int             `json:"attempt"`
 	Diagnostics string          `json:"diagnostics"`
+	// Round > 0 after F1 arbitration: a fresh attempt against a revised plan.
+	Round int `json:"round,omitempty"`
 }
 
 type DevelopResult struct {
@@ -128,6 +134,8 @@ type ReleaseInput struct {
 type ReleaseResult struct {
 	EvidenceHash string `json:"evidence_hash"`
 	PacketRef    string `json:"packet_ref"`
+	// RiskTier decides how many distinct approvers are needed (low | high).
+	RiskTier string `json:"risk_tier"`
 }
 
 type DecisionInput struct {
@@ -135,18 +143,22 @@ type DecisionInput struct {
 	Decision     Decision `json:"decision"`
 	HeadSHA      string   `json:"head_sha"`
 	EvidenceHash string   `json:"evidence_hash"`
+	// Refused, if set, means the decision was not accepted (maker-checker,
+	// freeze window, duplicate); it is audited, never counted.
+	Refused string `json:"refused,omitempty"`
 }
 
 // ---- helpers ----
 
 // Application error types the workflow maps to terminal states.
 const (
-	ErrAgentRefused   = "AgentRefused"
-	ErrBudget         = "BudgetExceeded"
-	ErrKilled         = "Killed"
-	ErrSensitiveData  = "SensitiveData"
-	ErrNeedsHuman     = "NeedsHuman"
-	ErrProviderDenied = "ProviderAccessDenied"
+	ErrAgentRefused        = "AgentRefused"
+	ErrProviderUnavailable = "ProviderUnavailable"
+	ErrBudget              = "BudgetExceeded"
+	ErrKilled              = "Killed"
+	ErrSensitiveData       = "SensitiveData"
+	ErrNeedsHuman          = "NeedsHuman"
+	ErrProviderDenied      = "ProviderAccessDenied"
 )
 
 // agentError turns an agent failure into the right Temporal error: terminal
@@ -173,7 +185,9 @@ func agentError(role string, err error) error {
 	case errors.Is(err, agents.ErrNeedsHuman):
 		return nr(ErrNeedsHuman)
 	case errors.Is(err, llm.ErrUnavailable):
-		return err // retried by Temporal with backoff
+		// Retryable: Temporal retries with backoff; if it still fails, the workflow
+		// pauses the run (F5) instead of failing it.
+		return temporal.NewApplicationError(role+": "+err.Error(), ErrProviderUnavailable, err)
 	default:
 		return nr(ErrScenario)
 	}
@@ -249,7 +263,7 @@ func (a *Activities) CreateRun(ctx context.Context, in Input) error {
 	// Tickets can contain card numbers or personal data; the ledger only ever keeps the redacted text.
 	requirement, _ := dlp.Redact(in.Requirement)
 	return a.Store.CreateRun(ctx, ledger.Run{RunID: in.RunID, TenantID: in.TenantID, Scenario: in.Scenario,
-		Repo: in.Repo, Requirement: requirement, Status: string(Queued), ConfigHash: in.ConfigHash})
+		Repo: in.Repo, Requirement: requirement, Status: string(Queued), ConfigHash: in.ConfigHash, Submitter: in.Submitter})
 }
 
 func (a *Activities) RecordTransition(ctx context.Context, t TransitionInput) error {
@@ -314,8 +328,8 @@ func (a *Activities) Analyze(ctx context.Context, in AgentInput) (AgentOutput, e
 
 func (a *Activities) Architect(ctx context.Context, in AgentInput) (AgentOutput, error) {
 	defer keepAlive(ctx)()
-	out, err := a.Agents.Architect(ctx, agents.ArchitectInput{Run: a.agentRun(in.Run, 0),
-		RequirementSpec: in.Prior, Worktree: in.Workspace.Path})
+	out, err := a.Agents.Architect(ctx, agents.ArchitectInput{Run: a.agentRun(in.Run, in.Round),
+		RequirementSpec: in.Prior, Worktree: in.Workspace.Path, Conflict: in.Conflict})
 	if err != nil {
 		if errors.Is(err, agents.ErrNeedsHuman) && out != nil {
 			// Keep the plan as evidence for the human design decision.
@@ -332,6 +346,9 @@ func (a *Activities) Architect(ctx context.Context, in AgentInput) (AgentOutput,
 func (a *Activities) Develop(ctx context.Context, in DevelopActivityInput) (DevelopResult, error) {
 	defer keepAlive(ctx)()
 	key := fmt.Sprintf("%s:develop:%d", in.Run.RunID, in.Attempt)
+	if in.Round > 0 {
+		key = fmt.Sprintf("%s:develop:%d:r%d", in.Run.RunID, in.Attempt, in.Round)
+	}
 	raw, err := a.Store.Once(ctx, in.Run.TenantID, in.Run.RunID, key, func() (json.RawMessage, error) {
 		wt := in.Workspace.worktree()
 		// Agents always start from the last committed state (attempt 1: the base;
@@ -457,7 +474,7 @@ func blockStatus(gate string) Status {
 	switch gate {
 	case "scope":
 		return BlockedScope
-	case "openapi", "hidden_tests":
+	case "openapi", "hidden_tests", "integrity":
 		return EscalatedHuman
 	default:
 		return BlockedSecurityVeto
@@ -635,13 +652,34 @@ func (a *Activities) Release(ctx context.Context, in ReleaseInput) (ReleaseResul
 	if err := os.WriteFile(filepath.Join(a.runDir(in.Run.RunID), "final.diff"), []byte(diff), 0o640); err != nil {
 		return ReleaseResult{}, err
 	}
-	return ReleaseResult{EvidenceHash: evidence, PacketRef: ref}, nil
+	// P3: risk tier decides how many distinct approvers are required.
+	var ps planScope
+	_ = json.Unmarshal(in.Plan, &ps)
+	changes, err := a.WS.Diff(ctx, wt, wt.BaseSHA, in.HeadSHA)
+	if err != nil {
+		return ReleaseResult{}, err
+	}
+	var changed []string
+	for _, c := range changes {
+		changed = append(changed, c.Path)
+	}
+	repo, _ := a.Cfg.Repo(in.Run.Repo)
+	tier := riskTier(changed, a.Cfg.Review.HighRiskPaths, ps.Scope.Adjacent, repo.DependencyFiles)
+	if err := a.Store.SetRunMeta(ctx, in.Run.TenantID, in.Run.RunID, in.Run.Submitter, tier); err != nil {
+		return ReleaseResult{}, err
+	}
+	return ReleaseResult{EvidenceHash: evidence, PacketRef: ref, RiskTier: tier}, nil
 }
 
 func (a *Activities) RecordDecision(ctx context.Context, in DecisionInput) error {
 	defer keepAlive(ctx)()
 	if in.Decision.Reviewer == "" {
 		return temporal.NewNonRetryableApplicationError("decision without a reviewer", ErrScenario, nil)
+	}
+	if in.Refused != "" {
+		return a.Store.RecordEvent(ctx, in.Run.TenantID, in.Run.RunID, "human.decision_refused", map[string]any{
+			"reviewer": in.Decision.Reviewer, "approve": in.Decision.Approve, "reason": in.Refused,
+			"head_sha": in.HeadSHA, "evidence_hash": in.EvidenceHash})
 	}
 	d := "REJECT"
 	if in.Decision.Approve {

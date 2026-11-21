@@ -29,6 +29,7 @@ var registry = map[string]gateFunc{
 	"dependencies": gates.Dependencies,
 	"openapi":      gates.OpenAPI,
 	"replay":       gates.Replay,
+	"integrity":    gates.Integrity,
 }
 
 // Known reports whether a gate name is implemented.
