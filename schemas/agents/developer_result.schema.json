@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aegis://schemas/agents/developer_result.schema.json",
+  "title": "developer_result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "modified_files",
+    "decision_log"
+  ],
+  "properties": {
+    "status": {
+      "enum": [
+        "IMPLEMENTED",
+        "DESIGN_CONFLICT"
+      ]
+    },
+    "modified_files": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "decision_log": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "decision",
+          "reason"
+        ],
+        "properties": {
+          "decision": {
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          },
+          "alternatives": {
+            "type": "array",
+            "minItems": 0,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "conflict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "needed_paths"
+      ],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "needed_paths": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "DESIGN_CONFLICT"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "conflict"
+        ]
+      },
+      "else": {
+        "required": [
+          "commit_sha"
+        ]
+      }
+    }
+  ]
+}

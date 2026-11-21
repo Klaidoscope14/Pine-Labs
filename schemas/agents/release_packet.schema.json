@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aegis://schemas/agents/release_packet.schema.json",
+  "title": "release_packet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "pr_title",
+    "summary",
+    "base_sha",
+    "head_sha",
+    "evidence_hash",
+    "risks",
+    "rollout",
+    "scorecard",
+    "cost_usd",
+    "latency_ms",
+    "approval"
+  ],
+  "properties": {
+    "pr_title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "base_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "evidence_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "risks": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "flag",
+        "canary",
+        "rollback"
+      ],
+      "properties": {
+        "flag": {
+          "type": "string",
+          "minLength": 1
+        },
+        "canary": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rollback": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "scorecard": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "must_passed",
+        "must_total",
+        "should_passed",
+        "should_total"
+      ],
+      "properties": {
+        "must_passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "must_total": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "should_passed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "should_total": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "cost_usd": {
+      "type": "number",
+      "minimum": 0
+    },
+    "latency_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "approval": {
+      "const": "PENDING_HUMAN"
+    }
+  }
+}

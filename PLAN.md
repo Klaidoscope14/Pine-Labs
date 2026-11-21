@@ -174,7 +174,7 @@ There's no component where Rust beats Go enough to pay for the compile-time and 
 | Frontend | Next.js 15 + Tailwind, SSE from the Go API, Monaco diff viewer |
 | Observability | OTel SDK → Collector → Jaeger + Prometheus → Grafana |
 | Events | NATS JetStream (live run events, replay, KV for rate-limit state) |
-| Artifacts | Object storage, content-addressed (MinIO locally, S3 in production) |
+| Artifacts | Object storage, content-addressed (SeaweedFS locally, S3 in production; MinIO no longer publishes Docker images) |
 | Identity and secrets | GitHub App (1-hour tokens), per-run capability JWTs (Ed25519), passkey (WebAuthn) approvals, OPA/Rego approval policy |
 | Scale and isolation | India-only deployment with a primary and a DR region, both set in config, plus a fail-closed jurisdiction guard (§16.3). Postgres row-level security, per-tenant queues and quotas, `SandboxProvider` interface (Docker now; Kubernetes + gVisor/Kata later) |
 | Configuration | One versioned, schema-validated config. Nothing hardcoded (§16.7) |
@@ -321,24 +321,161 @@ FastAPI, Python 3.12, SQLite or Postgres. Modules: `payments/`, `webhooks/`, `se
 
 ---
 
-## 10. 48-hour build plan (vertical slice first)
+## 10. 48-hour build plan (single source of truth)
 
-Assumes 3–4 people: **A** control plane (Go), **B** sandbox, gates and sample repo, **C** LLM agents and evals, **D** Cockpit and observability. With 2 people, merge A+C and B+D, and cut everything marked ✂.
+This merges the original schedule with the guardrail work (§15) and the scale and security work (§16). Team roles: **A** control plane (Go), **B** sandbox, gates and sample repo, **C** LLM agents and evals, **D** web app and observability. With two people, merge A+C and B+D.
 
-| Hours | Milestone | Exit criterion |
+| # | Phase | Hours | What gets built | Done when |
+|---|---|---|---|---|
+| 0 | **Foundation** | 0–3 | Repo layout, Docker Compose stack (Postgres, Temporal, NATS, object storage, OpenTelemetry, Jaeger, Prometheus, Grafana, smokescreen), schema-validated config with the jurisdiction check, JSON Schemas for every agent, sample repo `pine-settlements-svc` with the planted webhook bug, hardened sandbox image | See §10.1 exit criteria |
+| 1 | **Deterministic core (no AI yet)** | 3–10 | Sandbox runner, the gates as command-line tools returning JSON (pytest+coverage, ruff, Semgrep FIN-001..006, gitleaks, oasdiff, replay), diff-scope checker, Temporal workflow with stub agents, hash-chained ledger, idempotency keys, `tenant_id` + row-level security, repo mirror cache + worktrees | The full workflow runs end to end on stubbed agent output, and the gates pass or fail correctly on hand-written patches |
+| 2 | **Agents** | 10–18 | LLM router (format checks, repair, fallback, cost, prompt data filter), Analyst, Architect, Developer tool loop, Release, tool gateway, approval signals, kill switch | Demo 1 passes from the command line 5 times in a row |
+| 3 | **Failure handling, guardrails, concurrency** | 18–26 | F1–F6 as tested code paths, GitHub App (draft PR, evidence check, ruleset), FIN-007..014, dependency gate, maker-checker, scope leases, evidence bound to base+head SHA with rebase and re-test, admission control, per-run capability tokens, NATS events | Every failure scenario and guardrail has an automated test |
+| 4 | **Web app, eval and proof** | 26–40 | Next.js web app (intake, live progress, diff, evidence, approve/reject, kill switch, trace links), Grafana dashboards, eval harness (baseline vs. governed, N runs), fake LLM + k6 load test, simulated DR drill, red-team table | The full demo runs from the web app. Eval, load and red-team tables are filled in |
+| 5 | **Should-haves and polish** | 40–44 | Only if on schedule: passkey approvals, OPA policies, merge queue | — |
+| 6 | **Freeze and rehearse** | 44–48 | Code freeze, 3 rehearsals, backup recording, README (architecture, decision records, threat model, real vs. mocked, eval results), slides | Recorded demo and slides ready |
+
+**Cut order if behind:** passkeys + OPA → merge queue → Grafana (keep Jaeger) → arbitration (keep escalation) → fallback provider (keep pause and resume).
+**Already cut** (to pay for §16): mutation testing, rule_observer, Java Semgrep rules, freeze calendar, gVisor on the demo host, code-graph visualisation.
+**Never cut:** hidden tests, SHA-bound human gate, kill switch, scope tiers + leases, no-egress sandbox, FIN-013/014, prompt data filter, maker-checker, tenant isolation, jurisdiction check, validated config (§16.7), load-test evidence.
+
+### 10.1 Phase 0 design: Foundation
+
+**Goal:** everything later phases need exists, starts with one command, and is proven to work, before any agent or workflow code is written.
+
+**Repo layout**
+```
+./  (repo root)
+  cmd/aegis-api/          Go API (Phase 0: health and config only)
+  cmd/aegis-config/       CLI: validate a config file (used by make and CI)
+  internal/config/        Load YAML, validate against schema, jurisdiction check
+  schemas/config.schema.json
+  schemas/agents/*.schema.json      Agent input/output contracts (Appendix A.1)
+  schemas/agents/examples/          One valid example per schema (tested)
+  deploy/compose/         docker-compose.yml, versions.env, service configs
+  sandbox/Dockerfile      Hardened gate-runner image with pinned tools
+  samples/pine-settlements-svc/     Sample target repo (its own git repo at runtime)
+  evals/hidden/pine-settlements-svc/  Hidden oracle tests, never mounted for agents
+  config.example.yaml     Placeholders only
+  config.local.yaml       Local dev values (no secrets)
+  Makefile
+```
+
+**Decisions**
+- **Versions live in one file** (`deploy/compose/versions.env`), not in the compose file or code. Nothing is hardcoded.
+- **Every port binds to 127.0.0.1.** Nothing on the stack is reachable from the network.
+- **Sandbox image** comes from a pinned Python base, includes every gate tool plus the sample repo's dependencies, runs as a non-root user, and is run with `--network=none --read-only --cap-drop=ALL --security-opt=no-new-privileges --pids-limit --memory --cpus`. Limits come from config.
+- **Sample repo:** FastAPI + SQLite, modules `payments/ webhooks/ settlements/ ledger/ config/`. The planted bug: the webhook handler credits the ledger without checking `event_id`, so duplicate deliveries double-credit. Visible tests pass on the buggy code. A hidden oracle test fails on it, which proves the bug exists.
+- **Config guard:** `aegis-config validate` fails on schema errors, untagged endpoints, or endpoints outside `allowed_jurisdictions`. `aegis-api` runs the same check on startup and exits on failure.
+
+**Exit criteria (all must pass)**
+1. `make test`: Go unit tests pass (config guard, and every agent schema accepts its example).
+2. `make validate-config`: passes for `config.local.yaml`, and fails for each `testdata/bad-*.yaml`.
+3. `make sandbox-image` builds. `make sample-test` runs the sample repo's tests inside the hardened sandbox with no network, and they pass.
+4. `make hidden-test` shows the hidden duplicate-webhook test **failing** on the base code.
+5. `make sandbox-egress-check`: an outbound request from the sandbox fails.
+6. `make up`: every Compose service reports healthy. `make down` cleans up.
+
+**Status: done.** All six pass. Deviations: SeaweedFS replaces MinIO (no MinIO images any more); the Go builder is 1.25 (needed by smokescreen v0.1.0); the API listens on a port set in config.
+
+### 10.2 Phase 1 design: Deterministic core (no AI yet)
+
+**Goal:** the whole workflow runs end to end and makes correct decisions, with **stub agents that replay hand-written patches**. Every safety decision (gates, scope, retries, vetoes, ledger) is proven before any LLM is involved. In Phase 2, LLM agents replace the stubs behind the same contracts, and nothing else changes.
+
+#### Critique first: what could go wrong in this phase
+| Risk | Why it matters | Decision |
 |---|---|---|
-| 0–3 | Repo scaffolding, `docker compose` (Postgres, Temporal, OTel Collector, Jaeger, Prometheus, Grafana, smokescreen), JSON Schemas for every role, sample repo with planted bug, tests, OpenAPI, replay fixture | `make up` is green, and sample tests pass in the sandbox image |
-| 3–10 | **B:** sandbox runner (Go), gates as CLIs returning JSON (pytest+coverage, ruff, semgrep rules FIN-001..006, gitleaks, oasdiff, replay), diff-scope checker. **A:** Temporal workflow skeleton with *stub* agents, the ledger, idempotency keys | The whole blueprint runs end to end with stubbed LLM output, and gates fail and pass correctly on hand-written patches |
-| 10–18 | **C:** LLM router (schema validation, repair, fallback, cost), Analyst, Architect, Developer tool loop with the gateway, Release. **A:** signals for approval, kill switch | **Demo 1 passes via CLI 5 times in a row** |
-| 18–26 | Failure paths F1–F6 as real code paths with tests. GitHub draft PR + check-run + ruleset. Arbitration. Budget limits | Each F-scenario has an automated test |
-| 26–36 | **D:** Cockpit (intake, live DAG over SSE, diff, evidence matrix, approve/reject, kill switch, trace link). Grafana dashboard JSON. **C:** eval harness running in the background | Full demo can be driven from the UI. The eval table fills in |
-| 36–44 | ✂ Mutation gate, ✂ rule_observer, ✂ gVisor, ✂ Java Semgrep rules, ✂ code-graph visualisation. Polish | — |
-| 44–48 | Freeze. Rehearse 3×. Record a backup video. README: architecture, ADRs, threat model, mocked-vs-real table, eval results | Recorded demo plus a slide deck |
+| **The worker needs the Docker socket** | Access to `docker.sock` is root on the host. A compromised worker owns the machine | The worker never talks to Docker directly. It calls a `SandboxProvider` interface. Phase 1 implements it with the Docker SDK and runs the worker **on the host** (dev only). Production swaps in a Kubernetes + gVisor provider behind the same interface, and the worker never holds cluster-admin |
+| **Sandbox output is untrusted** | A malicious patch can make tests print anything, e.g. fake "all passed" lines or gigabytes of output | Gates use the tools' **machine-readable outputs** (JSON / JUnit XML), parsed in Go with strict decoding and a byte cap from config. Exit codes are cross-checked against parsed results. A mismatch fails the gate |
+| **Temporal history bloat** | Workflow payloads are size-limited. Passing full logs and diffs through history breaks at scale | Large outputs go to **object storage** (SeaweedFS), keyed by content hash. The workflow only carries hashes and small summaries |
+| **Workflow non-determinism** | Temporal replays workflow code; any clock, random or I/O call inside it corrupts replays | All I/O lives in activities. The config is passed in as a **snapshot plus hash** at run start, so a config change mid-run can't change its decisions |
+| **Retries double-apply side effects** | Temporal retries activities automatically. A retried "commit patch" could commit twice | Every side-effecting activity goes through `ledger.Once(key, fn)` with key = `run:step:attempt:input_hash`. A replay returns the stored result |
+| **Dependency CVE scan needs network** | `osv-scanner` queries an online database, and the sandbox has no network | Phase 1's dependency gate is **new-dependency detection plus a lockfile hash check** (fully offline). An offline OSV database, refreshed by a scheduled job outside the sandbox and mounted read-only, comes in Phase 3 |
+| **Heuristic Semgrep rules misfire** | e.g. "idempotency missing" can't be proven statically | Each rule has a `confidence` field. Only high-confidence rules can **block**; heuristic ones **flag** for the reviewer. Every rule ships with positive and negative test files run by `semgrep --test` |
+| **The agent could edit what the gates check against** | e.g. change replay expectations or hidden tests | Replay harness, expected balances and hidden tests live in `evals/` and are mounted **read-only, only into the gate container that needs them**. Never into the developer stage |
+| **Scope creep** | Phase 1 is the biggest phase and only ~7 hours | Must / should split below. Selective tests (§5.4) and the warm pool move to Phase 3 |
 
-**Cut order if behind:** rule_observer → mutation → gVisor → Grafana (keep Jaeger) → arbitration (keep escalation) → fallback provider (keep pause and resume).
-**Never cut:** hidden tests, signed human gate, kill switch, scope tiers, one real failure plus recovery, test-tampering and suppression gates (FIN-013/014), prompt DLP, maker-checker (see §15).
+#### Scope
+**Must (exit criteria depend on these):**
+1. **Workspace manager** (`internal/workspace`): a bare mirror of each repo (from the `code_host` endpoint in config), one `git worktree` per run on branch `agent/run-<id>` at a recorded base SHA, then commit and cleanup. Git is called with fixed argument lists, never through a shell.
+2. **Sandbox provider** (`internal/sandbox`): the `SandboxProvider` interface plus a Docker SDK implementation. It reuses Phase 0's hardening policy (refactored into one `Policy` used by both the CLI flags and the SDK), with timeout, output cap, OOM and timeout detection, and read-only or read-write mounts per call.
+3. **Gates** (`internal/gates`): each gate is a command run in the sandbox plus a Go parser, producing one normalised result:
+   `GateResult{gate, passed, verdict: PASS|FLAG|REMEDIABLE_FAIL|HARD_BLOCK, findings[], metrics, artifact_ref, tool_version, duration_ms}`
+   | Gate | Tool and output parsed | Notes |
+   |---|---|---|
+   | `scope` | Go, outside the sandbox: `git diff --numstat -z`, `--name-status` | Planned / adjacent / protected / out-of-scope tiers, diff budget, renames and deletes counted |
+   | `lint` | `ruff check --output-format json` | |
+   | `tests` | `pytest --junitxml` + `coverage json` | Full suite in Phase 1 |
+   | `hidden_tests` | `pytest --junitxml` with `evals/hidden` mounted read-only | Tier 2 only |
+   | `semgrep` | `semgrep --json --metrics=off --config rules/semgrep` | Rules FIN-001, 003, 004, 006 (FIN-002 secrets in `secrets`, FIN-005 protected paths in `scope`) |
+   | `bandit` | `bandit -f json` | |
+   | `secrets` | `gitleaks detect --report-format json` on the diff | Critical: always HARD_BLOCK |
+   | `dependencies` | Go: diff of lock and requirements files | New package means FLAG plus required human approval |
+   | `openapi` | export the spec in base and head worktrees, then `oasdiff breaking --format json` | Breaking change: HARD_BLOCK unless the plan declared it |
+   | `replay` | `evals/replay` harness, mounted read-only | Ledger invariants (one event, one credit; totals match) |
+4. **Semgrep rule pack** `rules/semgrep/` with test fixtures. The unmodified sample should **trip FIN-004** on the webhook handler, which is consistent with the planted bug.
+5. **Ledger** (`internal/ledger`, Postgres via `pgx`): tables `runs`, `steps`, `findings`, `approvals`, `side_effects`, `audit_events`, `chain_heads`. Embedded SQL migrations. **Hash-chained `audit_events`**: one chain per tenant, appends serialised with `SELECT … FOR UPDATE` on the chain head, plus a `Verify()` function and an `aegis-ledger verify` command.
+6. **Tenant isolation:** `tenant_id` on every table. **Row-level security with `FORCE`**, and the app connects as a non-owner role without `BYPASSRLS`. Every transaction sets `aegis.tenant_id` via `set_config(..., true)`.
+7. **Temporal workflow** (`internal/workflow`): the §5.2 blueprint as Go code with states as an enum. Activities: `PrepareWorkspace`, `Analyze`*, `Architect`*, `Develop`*, `CommitPatch`, `RunGates(tier)`, `CheckScope`, `Release`*, `Record`, `Cleanup` (* = stub in Phase 1). The retry loop is bounded by `workflow.max_ci_rounds` from the config snapshot. An `approve`/`reject` signal handles `AWAIT_HUMAN` (maker-checker comes in Phase 3).
+8. **Stub agents** (`internal/agents/stub`): they return scenario fixtures validated by `internal/contracts`. The stub developer applies hand-written patches, in order, per attempt.
+9. **Scenarios** (`evals/scenarios/<name>/`: `scenario.yaml`, contract fixtures, `attempt-N.patch`, `expect.yaml`):
+   | Scenario | Patches | Expected terminal state |
+   |---|---|---|
+   | `happy` | correct idempotent fix + tests | `AWAIT_HUMAN`, then `APPROVED` after the signal |
+   | `self-heal` | attempt 1 uses `float` for money (FIN-001); attempt 2 correct | `AWAIT_HUMAN` with finding OPEN → RESOLVED |
+   | `retry-exhausted` | every attempt breaks a test | `HALTED_RETRY_EXHAUSTED` after `max_ci_rounds` |
+   | `protected-file` | edits `app/config/payout_auth.py` | `BLOCKED_SCOPE`, repo untouched outside the run branch |
+   | `secret` | hard-codes an API key | `BLOCKED_SECURITY_VETO` |
+   | `design-conflict` | stub developer returns `DESIGN_CONFLICT` | `ESCALATED_HUMAN` (arbitration comes in Phase 3) |
+10. **CLI** `aegis-run`: start a scenario against the live stack, follow its state, print the terminal state and the ledger summary.
 
-> **Superseded by §16.6:** the scale and security work replaces mutation testing, rule_observer, Java rules, the freeze calendar and gVisor-on-demo. §16.6 has the updated cut list and never-cut list.
+**Should (only if on schedule):** artifact upload to SeaweedFS (otherwise store artifacts on local disk keyed by hash, same interface), `ledger verify` exposed through the API, worker metrics via OpenTelemetry.
+
+**Moved out of Phase 1:** selective tests and warm pool → Phase 3. Offline OSV database → Phase 3. NATS events → Phase 3 (Phase 1 writes state changes to the ledger only).
+
+#### How it plugs into Phase 0
+| Phase 0 piece | Phase 1 use |
+|---|---|
+| `config` + schema | New keys: `workspace.{mirrors_dir, runs_dir}`, `temporal.{namespace, task_queue}`, `sandbox.max_output_bytes`, `gates.tier1[]`, `gates.tier2[]`. Endpoints for Postgres, Temporal and code host come from `endpoints[]`. Secret refs (`env:`) are resolved by a new `config.ResolveSecret` |
+| `internal/sandbox` flags | Refactored into `Policy`. The CLI flags and the SDK `HostConfig` are generated from the same policy, so they can't drift. Existing tests keep passing |
+| `internal/contracts` | Validates every stub output: the same path Phase 2's LLM outputs take |
+| Sandbox image | Runs every gate. No change except adding the Semgrep rule pack and replay harness as **read-only mounts** (not baked in, so rules can change without a rebuild) |
+| Sample repo | `make seed-repo` turns `samples/pine-settlements-svc` into a bare git repo under the `code_host` path, so the workflow pulls from a "remote" like it will from GitHub |
+| Compose stack | Postgres (ledger + Temporal) and Temporal are used for real. A migration creates the `aegis_app` role with its password from `.env.secrets` |
+| Makefile | New targets: `migrate`, `seed-repo`, `worker`, `run S=<scenario>`, `phase1` |
+
+#### Package layout added
+```
+cmd/aegis-worker/        Temporal worker (runs on the host in dev)
+cmd/aegis-run/           Start and follow a scenario run
+cmd/aegis-ledger/        verify | show <run-id>
+internal/workspace/      mirror, worktree, commit, diff
+internal/sandbox/        Policy, SandboxProvider, docker provider
+internal/gates/          one file per gate: command + parser; golden test data
+internal/scope/          diff-scope checker
+internal/ledger/         migrations, store, RLS, hash chain, Once()
+internal/workflow/       blueprint, states, activities
+internal/agents/stub/    scenario-driven stub agents
+rules/semgrep/           FIN rules + tests
+evals/replay/            replay harness + expected balances (read-only mount)
+evals/scenarios/         six scenarios
+```
+
+#### Order of work (with team roles)
+| Hours | A (control plane) | B (sandbox, gates) |
+|---|---|---|
+| 3–5 | Config keys, ledger schema + migrations + RLS + chain, `Once()` | `Policy` refactor, Docker SDK provider, workspace manager |
+| 5–7 | Temporal workflow + stub agents + scenarios (unit-tested with Temporal's test environment) | Gates + parsers (golden files), Semgrep rules + tests, scope checker |
+| 7–9 | Worker + `aegis-run`, wire real activities | Replay harness, openapi gate, dependency gate |
+| 9–10 | End-to-end scenario runs, crash and concurrency checks | Same |
+
+#### Exit criteria (all must pass, `make phase1`)
+1. **Unit tests:** scope checker (table-driven, including renames, deletes and globs), every gate parser against recorded tool output, `semgrep --test` for every FIN rule, ledger chain verification including **detection of a tampered row**, an RLS test proving tenant A can't read tenant B's rows, `Once()` returning the stored result on repeat, and workflow tests for all six scenarios in Temporal's test environment.
+2. **Base code check:** gates on the untouched sample report visible tests passing, FIN-004 flagging the webhook handler, and hidden tests failing.
+3. **Live end-to-end:** `make run S=<name>` reaches the expected terminal state for all six scenarios on the real stack, with real git, sandbox and Postgres. `aegis-ledger verify` passes afterwards.
+4. **Concurrency:** all six scenarios started at once finish correctly, each with its own worktree and branch, and no cross-talk in the ledger.
+5. **Crash safety:** killing the worker mid-run and restarting it completes the run with **no duplicate commits or ledger entries**.
+6. **Isolation:** no gate container has network access, hidden tests are only ever mounted into the hidden-test gate, and the developer stage never sees `evals/`.
 
 ---
 
@@ -504,7 +641,7 @@ The design below attacks each one in that order. Saying this out loud to the jud
 | No coordination between runs | Two runs edit `webhooks/handler.py` at once and produce conflicting PRs | **Scope leases**: the Architect's planned files take a time-limited advisory lease. An overlapping run waits, or is marked "stacked on #N" |
 | Single tenant, no residency checks | Many teams share one system, and nothing stops a misconfigured backup, log sink or LLM endpoint from sending data outside India | Per-tenant isolation + a **fail-closed jurisdiction guard** (§16.3) |
 | Personal access token for GitHub | Long-lived secret, broad rights, shared rate limit | **GitHub App**: installation tokens expire after **1 hour**, are scoped per repo with minimal permissions, and get their own rate-limit budget |
-| Artifacts (diffs, logs, reports) in Postgres rows | Database bloat | **Object storage** (S3; MinIO locally), content-addressed by hash. Postgres keeps only metadata and hashes |
+| Artifacts (diffs, logs, reports) in Postgres rows | Database bloat | **Object storage** (S3; SeaweedFS locally), content-addressed by hash. Postgres keeps only metadata and hashes |
 
 ### 16.2 Concurrency controls (build in 48 h)
 - **Admission control with review work-in-progress limits.** Each team has a configurable cap on open agent PRs awaiting review (`review.wip_per_reviewer`). Above the cap, new runs still *plan* but park at `QUEUED_REVIEW_CAPACITY` before opening a PR. A Grafana panel shows queue depth.

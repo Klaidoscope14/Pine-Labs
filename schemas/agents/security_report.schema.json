@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aegis://schemas/agents/security_report.schema.json",
+  "title": "security_report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "commit_sha",
+    "verdict",
+    "findings"
+  ],
+  "properties": {
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "REMEDIABLE_FAIL",
+        "HARD_BLOCK"
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "rule_id",
+          "severity",
+          "file",
+          "line",
+          "commit_sha",
+          "status",
+          "remediation"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rule_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "severity": {
+            "enum": [
+              "LOW",
+              "MEDIUM",
+              "HIGH",
+              "CRITICAL"
+            ]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "commit_sha": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{7,64}$"
+          },
+          "status": {
+            "enum": [
+              "OPEN",
+              "RESOLVED",
+              "STALE"
+            ]
+          },
+          "remediation": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,90 @@
+# AegisSDLC configuration template.
+# Copy to config.<env>.yaml and replace every <placeholder>.
+# Rules:
+#   - Nothing in services is hardcoded; it all comes from this file.
+#   - Secrets are never written here. Use env:NAME or vault:path references.
+#   - Every endpoint must declare a jurisdiction in data_residency.allowed_jurisdictions,
+#     or services refuse to start.
+version: 1
+
+deployment:
+  environment: <local|staging|production>
+  primary_region: <primary-region-in-india>
+  dr_region: <dr-region-in-india>
+
+data_residency:
+  allowed_jurisdictions: [IN]
+
+endpoints:
+  - { name: postgres,      kind: database,       url: <postgres-host:port/db>,   jurisdiction: IN, credentials_ref: env:AEGIS_POSTGRES_DSN }
+  - { name: temporal,      kind: workflow,       url: <temporal-host:port>,      jurisdiction: IN }
+  - { name: nats,          kind: events,         url: <nats://host:port>,        jurisdiction: IN }
+  - { name: artifacts,     kind: object_storage, url: <s3-endpoint>,             jurisdiction: IN, credentials_ref: env:AEGIS_S3_CREDENTIALS }
+  - { name: backups,       kind: backup,         url: <backup-location>,         jurisdiction: IN }
+  - { name: otel,          kind: telemetry,      url: <otel-collector:4317>,     jurisdiction: IN }
+  - { name: egress-proxy,  kind: egress_proxy,   url: <smokescreen-host:port>,   jurisdiction: IN }
+  - { name: code-host,     kind: code_host,      url: <code-host-api-url>,       jurisdiction: IN, credentials_ref: vault:<path-to-github-app-key> }
+  - { name: llm-primary,   kind: llm,            url: <india-hosted-llm-endpoint>, jurisdiction: IN }
+
+llm:
+  providers:
+    - name: primary
+      endpoint: llm-primary
+      api_key_ref: env:AEGIS_LLM_PRIMARY_KEY
+      models:
+        analyst: <model-id>
+        architect: <model-id>
+        developer: <model-id>
+        release: <model-id>
+      price_table_ref: <price-table-file>
+  fallback_order: [primary]
+
+workflow:
+  max_ci_rounds: 2          # Stripe Minions default
+  max_schema_repairs: 2
+  max_arbitration_rounds: 1
+
+budget:
+  per_run_tokens: <int>
+  per_run_usd: <number>
+  per_tenant_daily_usd: <number>
+
+review:
+  wip_per_reviewer: <int>
+  required_approvers: { low: 1, high: 2, protected: 2 }
+
+scope:
+  protected_paths: [<glob>]
+  diff_budget: { files: <int>, lines: <int> }
+  lease_ttl_seconds: <int>
+
+sandbox:
+  image: <registry/image@sha256:digest>
+  cpus: <number>
+  memory_mb: <int>
+  pids: <int>
+  timeout_seconds: <int>
+  warm_pool_size: <int>
+  network: none
+
+tenants:
+  - { id: <tenant-id>, concurrency: <int>, queue_priority: normal, daily_usd: <number> }
+
+tokens:
+  capability_ttl_seconds: <int>
+
+approval:
+  expiry_seconds: <int>
+
+api:
+  listen: <host:port>
+
+gates:
+  enabled: [scope, lint, tests, hidden_tests, semgrep, bandit, secrets, dependencies, openapi, replay]
+  rules_ref: <rule-pack-version>
+
+slo: {}            # targets chosen after the first load test
+load:
+  concurrent_runs: <int>
+policy:
+  bundle_ref: <opa-bundle-version>

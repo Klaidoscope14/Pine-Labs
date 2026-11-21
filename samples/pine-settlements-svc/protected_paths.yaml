@@ -1,0 +1,6 @@
+# Paths agents may never modify. Mirrors scope.protected_paths in the AegisSDLC config.
+protected:
+  - app/config/payout_auth.py
+  - .agent-rules.md
+  - protected_paths.yaml
+  - .github/**
