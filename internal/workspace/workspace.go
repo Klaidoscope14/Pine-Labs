@@ -329,7 +329,12 @@ func (m Manager) ShowFile(ctx context.Context, wt Worktree, commit, path string)
 
 // ExportTree writes the tree of a commit into dir (used to scan the base side).
 func (m Manager) ExportTree(ctx context.Context, wt Worktree, commit, dir string) error {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	// World-readable: the tree is mounted read-only into sandboxes, which run as an
+	// unprivileged user (uid 10001) that does not own it. It holds only repo code.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
 		return err
 	}
 	_, err := m.git(ctx, wt.Path, "--work-tree="+dir, "checkout", commit, "--", ".")

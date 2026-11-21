@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"slices"
@@ -268,7 +269,28 @@ func matchAny(globs []string, p string) bool {
 	return false
 }
 
+// importGraph returns the repository's import graph, cached per tree hash
+// (PLAN.md §10.5, L5): every run on the same base reuses it.
 func (a *Agents) importGraph(ctx context.Context, worktree, repoName string) string {
+	var cache string
+	if out, err := exec.CommandContext(ctx, "git", "-C", worktree, "rev-parse", "HEAD^{tree}").Output(); err == nil {
+		tree := strings.TrimSpace(string(out))
+		cache = filepath.Join(a.Cfg.Path(a.Cfg.Workspace.ArtifactsDir), "repo-index", repoName, tree+".importgraph.json")
+		if data, err := os.ReadFile(cache); err == nil && json.Valid(data) {
+			return string(data)
+		}
+	}
+	g := a.computeImportGraph(ctx, worktree, repoName)
+	if cache != "" && json.Valid([]byte(g)) && os.MkdirAll(filepath.Dir(cache), 0o750) == nil {
+		tmp := fmt.Sprintf("%s.tmp-%d", cache, time.Now().UnixNano())
+		if os.WriteFile(tmp, []byte(g), 0o640) == nil {
+			_ = os.Rename(tmp, cache)
+		}
+	}
+	return g
+}
+
+func (a *Agents) computeImportGraph(ctx context.Context, worktree, repoName string) string {
 	repo, _ := a.Cfg.Repo(repoName)
 	script := a.Cfg.Path(a.Cfg.Agents.ImportGraphScript)
 	cmd := append([]string{"python", "/tools/" + filepath.Base(script), "/work"}, repo.SourceDirs...)

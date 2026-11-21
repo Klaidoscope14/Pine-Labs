@@ -115,6 +115,9 @@ type Provider struct {
 	AllowedRegions       []string          `json:"allowed_regions,omitempty"`
 	// Command is the Claude Code CLI to run (kind claude_code; default "claude").
 	Command string `json:"command,omitempty"`
+	// MaxInFlight caps concurrent requests to this provider from one worker, so a
+	// burst of runs queues locally instead of triggering rate-limit retry storms.
+	MaxInFlight int `json:"max_in_flight,omitempty"`
 }
 
 // RoleSettings tunes one agent role.

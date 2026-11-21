@@ -7,7 +7,9 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go/v2"
 )
@@ -165,5 +167,40 @@ func TestClaudeCodeLive(t *testing.T) {
 	t.Logf("%s", raw)
 	if msg.StopReason != anthropic.StopReasonToolUse && msg.StopReason != anthropic.StopReasonEndTurn {
 		t.Fatalf("stop reason %q", msg.StopReason)
+	}
+}
+
+type slowProvider struct {
+	mu          sync.Mutex
+	running, pk int
+}
+
+func (s *slowProvider) Name() string        { return "slow" }
+func (s *slowProvider) Model(string) string { return "m" }
+func (s *slowProvider) Send(context.Context, Call, anthropic.MessageNewParams) (*anthropic.Message, error) {
+	s.mu.Lock()
+	s.running++
+	if s.running > s.pk {
+		s.pk = s.running
+	}
+	s.mu.Unlock()
+	time.Sleep(15 * time.Millisecond)
+	s.mu.Lock()
+	s.running--
+	s.mu.Unlock()
+	return &anthropic.Message{}, nil
+}
+
+func TestLimitedCapsInFlight(t *testing.T) {
+	inner := &slowProvider{}
+	l := &Limited{Inner: inner, Slots: make(chan struct{}, 2)}
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); _, _ = l.Send(context.Background(), Call{}, anthropic.MessageNewParams{}) }()
+	}
+	wg.Wait()
+	if inner.pk > 2 {
+		t.Fatalf("peak in flight %d, cap 2", inner.pk)
 	}
 }

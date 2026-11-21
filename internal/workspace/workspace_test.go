@@ -196,3 +196,49 @@ func TestRefreshKeepsRunBranches(t *testing.T) {
 		t.Fatalf("run branch damaged: %d %v", n, err)
 	}
 }
+
+// Regression (found on Linux/EC2): the exported base tree is mounted into
+// sandboxes running as an unprivileged user, so it must be world-readable.
+func TestExportTreeIsReadableBySandboxUser(t *testing.T) {
+	ctx := context.Background()
+	m := Manager{MirrorsDir: t.TempDir(), RunsDir: t.TempDir(), AuthorName: "aegis", AuthorMail: "aegis@local"}
+	mirror, _ := m.EnsureMirror(ctx, newRemote(t))
+	base, _ := m.ResolveRef(ctx, mirror, "main")
+	wt, err := m.CreateWorktree(ctx, mirror, "w1", base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "base")
+	if err := m.ExportTree(ctx, wt, base, dir); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(dir)
+	if err != nil || info.Mode().Perm()&0o005 != 0o005 {
+		t.Fatalf("base tree mode %v, want others r-x", info.Mode().Perm())
+	}
+}
+
+// Snapshot captures work in progress without moving HEAD, and its tree hash
+// equals the tree of the commit later made from the same files.
+func TestSnapshotMatchesLaterCommitTree(t *testing.T) {
+	ctx := context.Background()
+	m := Manager{MirrorsDir: t.TempDir(), RunsDir: t.TempDir(), AuthorName: "aegis", AuthorMail: "aegis@local"}
+	mirror, _ := m.EnsureMirror(ctx, newRemote(t))
+	base, _ := m.ResolveRef(ctx, mirror, "main")
+	wt, _ := m.CreateWorktree(ctx, mirror, "w1", base)
+	os.WriteFile(filepath.Join(wt.Path, "app", "a.py"), []byte("x = 3\n"), 0o644)
+	snap, tree, err := m.Snapshot(ctx, wt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head, _ := m.Head(ctx, wt); head != base {
+		t.Fatal("Snapshot moved HEAD")
+	}
+	if changes, _ := m.Diff(ctx, wt, base, snap); len(changes) != 1 {
+		t.Fatalf("snapshot diff = %+v", changes)
+	}
+	sha, _ := m.CommitWorking(ctx, wt, "agent change", "k1")
+	if got, _ := m.TreeOf(ctx, wt, sha); got != tree {
+		t.Fatalf("commit tree %s != snapshot tree %s", got, tree)
+	}
+}

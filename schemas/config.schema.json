@@ -314,6 +314,11 @@
                 "type": "boolean",
                 "description": "kind=bedrock: check at startup that the inference profile only routes to allowed regions."
               },
+              "max_in_flight": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Concurrent requests to this provider from one worker; extra calls wait."
+              },
               "allowed_regions": {
                 "type": "array",
                 "items": {

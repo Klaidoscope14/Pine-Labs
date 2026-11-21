@@ -197,7 +197,30 @@ func Build(ctx context.Context, cfg *config.Config) ([]Provider, error) {
 				p = &Recorder{Inner: sp, Dir: cfg.Path(pc.CassetteDir)}
 			}
 		}
+		if pc.MaxInFlight > 0 {
+			p = &Limited{Inner: p, Slots: make(chan struct{}, pc.MaxInFlight)}
+		}
 		out = append(out, p)
 	}
 	return out, nil
+}
+
+// Limited caps concurrent requests to one provider (PLAN.md §10.5, L15): calls
+// beyond the cap wait for a slot (or their context), instead of all hitting the
+// provider at once and retrying on rate-limit errors.
+type Limited struct {
+	Inner Provider
+	Slots chan struct{}
+}
+
+func (l *Limited) Name() string             { return l.Inner.Name() }
+func (l *Limited) Model(role string) string { return l.Inner.Model(role) }
+func (l *Limited) Send(ctx context.Context, call Call, params anthropic.MessageNewParams) (*anthropic.Message, error) {
+	select {
+	case l.Slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-l.Slots }()
+	return l.Inner.Send(ctx, call, params)
 }
