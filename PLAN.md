@@ -734,6 +734,25 @@ Every step adds Grafana panels for time per stage (planning, Developer turns, to
 | L18 self-hosted DeepSeek | production path | |
 | Sandbox concurrency limit (§10.4) | **built** | `sandbox.max_concurrent`, a host-memory check at worker start, `sandbox.runtime: runsc` (gVisor) |
 
+
+### 10.6 Lessons from Razorpay engineering (read 2026-11-22)
+Razorpay runs payments at Indian scale on Go, AWS and Kubernetes, so their engineering blog is a close match for our stack and regulator. These are the ideas worth adopting, each tied to its post:
+
+| # | Idea | Source post | Where it lands |
+|---|---|---|---|
+| R1 | **Metric cardinality discipline:** never label Prometheus metrics with run IDs, file paths or ticket text; per-run detail goes in traces and the ledger. Regular reviews to drop vanity metrics | Scaling to trillions of metric data points | Phase 4 Grafana work (we have no app metrics yet, so the rule comes first) |
+| R2 | **Goroutine-leak tests** (`goleak`) in every package that starts goroutines | Detecting Goroutine Leaks with Test Cases | **Done:** sandbox, llm, gaterun, gateway |
+| R3 | **Bound Go memory explicitly:** per-request object churn made RSS balloon (idle heap not returned to the OS) and forced over-scaling. Set `GOMEMLIMIT` on the worker, export Go runtime metrics (heap in use vs. idle) | Go Consuming All Your Resources? (76% infra cost cut) | Phase 4, with the AWS sizing in §10.4 |
+| R4 | **Automatic failure triage and RCA timeline:** about 75% of their incidents had an external cause, found by engineers running the same queries by hand. Classify every failed run automatically (provider outage, infrastructure, gate failure, agent failure), build the timeline from the hash-chained audit log, and add a "what we missed" section like their improved 5-Why template | Auto Incident Management; Ops to Bots; Improving the 5 Why RCA format | Phase 3 failure handling; Phase 4 web app run page |
+| R5 | **Drift detection for the deployment:** console changes silently diverge from IaC. Add `make deploy-drift` (CloudFormation drift detection) and refuse to deploy over unexplained drift | The Dark Side of Terraform: Drifts | Phase 4, with `make deploy` |
+| R6 | **Gradual rollout of speed changes:** roll out changes such as adaptive effort to a percentage of runs, compare against the rest, then ramp (their Splitz platform) | Building Splitz | §10.5 invariant 8: every speed change is benchmarked before full rollout |
+| R7 | **Spot instances for gate workers** with automatic on-demand fallback (60% of their production runs on spot). Gate activities are stateless and Temporal retries them, so an interruption costs only a retry | Cost Optimization part 1; Spot nodes part 4 | Production path only (the demo instance holds state) |
+| R8 | **Multi-arch images** (buildx, `TARGETARCH`): Graviton gave them 12–25% savings; one Dockerfile builds for both ARM and x86, so x86 developers aren't blocked | Migrating to AWS Graviton | Our images already build on ARM (Mac and m7g); add x86 when a contributor needs it |
+| R9 | **Webhooks instead of polling,** with signature checks and idempotent handling | Real-Time Webhooks | Phase 3 GitHub App |
+| R10 | **Block breaking changes at PR time:** 10–15% of their PRs had build-breaking changes, caught before merge; MTTA fell from hours to 2–3 min | High Availability on Payments Dashboard; Ops to Bots | Validates our gate-first design; MTTA alerting for stuck runs in Phase 4 |
+
+**Not adopted:** leader election with Consul (Temporal already guarantees one execution per workflow ID); Kong-specific configuration; AIOps (too general to act on).
+
 ---
 
 ## 11. Demo script (6 minutes)
