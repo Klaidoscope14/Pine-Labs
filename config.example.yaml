@@ -16,7 +16,8 @@ data_residency:
   allowed_jurisdictions: [IN]
 
 endpoints:
-  - { name: postgres,      kind: database,       url: <postgres-host:port/db>,   jurisdiction: IN, credentials_ref: env:AEGIS_POSTGRES_DSN }
+  - { name: postgres-admin, kind: database,      url: <postgres://owner@host:port/db>, jurisdiction: IN, credentials_ref: env:<OWNER_PASSWORD_VAR> }
+  - { name: postgres,      kind: database,       url: <postgres://app_role@host:port/db>, jurisdiction: IN, credentials_ref: env:AEGIS_APP_DB_PASSWORD }
   - { name: temporal,      kind: workflow,       url: <temporal-host:port>,      jurisdiction: IN }
   - { name: nats,          kind: events,         url: <nats://host:port>,        jurisdiction: IN }
   - { name: artifacts,     kind: object_storage, url: <s3-endpoint>,             jurisdiction: IN, credentials_ref: env:AEGIS_S3_CREDENTIALS }
@@ -66,6 +67,7 @@ sandbox:
   timeout_seconds: <int>
   warm_pool_size: <int>
   network: none
+  max_output_bytes: <int>     # cap on any tool output read back from a sandbox
 
 tenants:
   - { id: <tenant-id>, concurrency: <int>, queue_priority: normal, daily_usd: <number> }
@@ -81,7 +83,41 @@ api:
 
 gates:
   enabled: [scope, lint, tests, hidden_tests, semgrep, bandit, secrets, dependencies, openapi, replay]
+  tier1: [scope, lint, tests]
+  security: [semgrep, bandit, secrets, dependencies]
+  tier2: [hidden_tests, openapi, replay]
+  parallelism: <int>
+  semgrep_rules_dir: <path>
   rules_ref: <rule-pack-version>
+
+workspace:
+  mirrors_dir: <path>
+  runs_dir: <path>
+  artifacts_dir: <path>
+  commit_author_name: <agent-commit-name>
+  commit_author_email: <agent-commit-email>
+
+temporal: { endpoint: temporal, namespace: <namespace>, task_queue: <queue>, max_concurrent_activities: <int>, heartbeat_seconds: <int> }
+
+ledger:
+  admin_endpoint: postgres-admin
+  app_endpoint: postgres
+  app_role: <app_role>
+  app_password_ref: env:AEGIS_APP_DB_PASSWORD
+
+repos:
+  - name: <repo-name>
+    endpoint: code-host
+    path: <repo-path-on-code-host>
+    default_branch: <branch>
+    source_dirs: [<dir>]
+    dependency_files: [<file>]
+    openapi_export: [<argv>]
+
+evals:
+  hidden_tests_dir: <path>
+  replay_dir: <path>
+  scenarios_dir: <path>
 
 slo: {}            # targets chosen after the first load test
 load:

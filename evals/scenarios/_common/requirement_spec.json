@@ -1,0 +1,15 @@
+{
+  "clarified_summary": "The acquiring bank retries settlement webhooks, so the same event can arrive more than once. Each event must credit the merchant's ledger exactly once.",
+  "assumptions": ["event_id is unique per bank event", "the webhook signature check stays unchanged"],
+  "acceptance_criteria": [
+    {"id": "AC-1", "description": "A webhook delivered twice with the same event_id credits the ledger once.", "verification_type": "unit_test", "must": true},
+    {"id": "AC-2", "description": "Concurrent duplicate deliveries credit the ledger once.", "verification_type": "integration_test", "must": true},
+    {"id": "AC-3", "description": "Replaying recorded traffic with duplicates leaves correct balances.", "verification_type": "replay", "must": true},
+    {"id": "AC-4", "description": "Distinct events still credit normally.", "verification_type": "unit_test", "must": true}
+  ],
+  "task_plan": [
+    {"id": "T-1", "description": "Record processed event_ids with a unique key and credit only on first sight, inside one transaction."},
+    {"id": "T-2", "description": "Add a regression test for duplicate delivery."}
+  ],
+  "risk_flags": ["Touches money movement", "Schema change (new table)"]
+}

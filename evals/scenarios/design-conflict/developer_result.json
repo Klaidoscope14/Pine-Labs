@@ -1,0 +1,8 @@
+{
+  "status": "DESIGN_CONFLICT",
+  "modified_files": [],
+  "decision_log": [
+    {"decision": "Stop instead of working around the plan", "reason": "Deduplication needs a migration helper outside the planned files"}
+  ],
+  "conflict": {"reason": "A safe fix needs app/ledger/store.py, which is outside the planned scope.", "needed_paths": ["app/ledger/store.py"]}
+}

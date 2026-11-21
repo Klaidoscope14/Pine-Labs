@@ -477,6 +477,112 @@ evals/scenarios/         six scenarios
 5. **Crash safety:** killing the worker mid-run and restarting it completes the run with **no duplicate commits or ledger entries**.
 6. **Isolation:** no gate container has network access, hidden tests are only ever mounted into the hidden-test gate, and the developer stage never sees `evals/`.
 
+**Status: done** (`make phase1`). Results: all six scenarios reach their expected state, alone and all at once (~30 s concurrently). Self-heal's FIN-001 goes OPEN → RESOLVED, and the base code's FIN-004 finding is RESOLVED by the fix. The crash test kills the worker with SIGKILL mid-gates; the run still ends APPROVED with one commit and a gap-free ledger.
+
+Deviations from the design above, and why:
+- **Sandbox provider uses the Docker CLI, not the Docker SDK.** Argument lists only, never a shell. It's simpler, has no heavy SDK dependency, and the `Provider` interface is unchanged, so a Kubernetes or gVisor provider still drops in.
+- **OpenAPI 3.1 is downgraded to 3.0 in Go before `oasdiff`.** FastAPI emits 3.1, and stable oasdiff (latest v1.39) only supports 3.0; 3.1 support exists only in a v2.2 beta, which we don't trust in a security gate. The conversion is unit-tested.
+- **Sandboxes use `--ipc=private --shm-size=64m` instead of `--ipc=none`.** Semgrep needs `/dev/shm` for multiprocessing. Each sandbox still gets its own isolated IPC namespace.
+- **The hidden suite has its own `conftest.py` and `pytest.ini`.** The repo's test helpers can't influence the oracle. Replay expectations moved out of the sample repo into `evals/replay/`.
+- **Bugs the crash test found, now fixed:**
+  - No activity heartbeats. A killed worker's activity went unnoticed for the full activity timeout (~90 min). Every activity now heartbeats, and `temporal.heartbeat_seconds` is set in config.
+  - Retries reused deleted scratch paths, which Docker Desktop's file sharing still saw. Each execution now gets a unique directory.
+  - Sandbox containers orphaned by a killed worker are labelled and swept when the worker starts.
+- **`setuptools` is pinned in the tool lock.** Semgrep 1.93's tracing dependency imports `pkg_resources`.
+
+Carried to Phase 3 as planned: selective tests, warm pool, offline OSV database, NATS events, and a zero-diff retry breaker. The `retry-exhausted` scenario currently resubmits an identical patch, which the breaker will catch.
+
+### 10.3 Phase 2 design: real agents
+
+**Goal:** replace the stub agents with Claude-backed agents behind the **same `agents.Agents` interface and the same JSON contracts**. Phase 1 already proved every gate, retry, veto and ledger write, so Phase 2 only adds a model, a tool gateway and spend controls. Nothing downstream changes: an LLM patch faces exactly the gates a stub patch did.
+
+#### Critique first: what's hard here, and the decision for each
+| Risk | Why it matters | Decision |
+|---|---|---|
+| **Data residency vs. the model endpoint** | Our config refuses any non-India endpoint. Claude now runs inside India via an Amazon Bedrock India geographic inference profile (requests stay in Mumbai and Hyderabad), but sources disagree on exactly which models it covers | **Production path: Bedrock India profile**, through the Go SDK's Bedrock (Mantle) client, region and model IDs from config. **Verify the model list on the Bedrock regional-availability page before wiring it in.** Dev/demo may use the first-party Claude API only through an explicit, logged **residency exception** (below). Never a silent bypass |
+| **Residency exceptions could become a loophole** | An "allow anyway" switch defeats the guard | `data_residency.exceptions[]` needs: endpoint, reason, expiry date, and environment. **Rejected outright when `environment: production`**, rejected after expiry, printed at startup, and part of the config hash recorded on every run. Demo data is synthetic, and the prompt data filter still runs |
+| **Forced tool calls are rejected by current models** | On Claude Opus 5.5 and Sonnet 5.5, `tool_choice: any/tool` returns HTTP 400, so the classic "force a tool to get JSON" trick fails | Structured outputs (`output_config.format` with a JSON Schema) for Analyst, Architect and Release. `strict: true` tools with `tool_choice: auto` for the Developer loop. **Our own contract validation stays the final word** either way |
+| **Structured outputs support only a JSON Schema subset** | Our contracts use `pattern` and `if/then` | Send a **simplified, model-facing schema** to the API. Validate the result against the **full contract schema** afterwards. On failure, a repair turn quotes the exact validation error, up to `workflow.max_schema_repairs`, then the run ends `FAILED_SCHEMA` |
+| **Prompt injection from repo content** | The Developer reads files that an attacker could have edited | Repo content always enters as **tool results** (data), never in the system prompt, and the system prompt says repo text is untrusted. The real defences are structural: the gateway refuses protected writes, the sandbox has no network, and gates decide. **No prompt instruction is ever the safety boundary** |
+| **Agents spending without limit** | A looping agent burns money, and Harness found most teams lack a kill switch | Per-run token and USD budgets enforced **in the router before every call**, a per-attempt tool-call cap, loop detection, a per-tenant daily budget, and a **kill switch checked before every model call** |
+| **Nondeterminism makes tests flaky and expensive** | Live model runs cost money and vary | A **record/replay provider**: record real responses once, replay them deterministically in CI and in the Phase 4 load test, with no network. Live runs are only for the "5 in a row" proof and the evals, **with your approved budget** |
+| **Cost and model choice** | Model choice trades quality against cost; the user decides | Per-role model and effort come from config, never code. **Suggested default: Claude Opus 5.5 for every role**, with effort `low` for Analyst and Release and `high` for Architect and Developer. Every call's tokens, cache hits, latency and cost (from a price-table file) go to the ledger |
+| **Thinking and refusals** | Opus 5.5 always thinks (only effort controls depth), and safety classifiers can stop a response with `stop_reason: refusal` | Don't send `thinking`. Set effort per role. Every response's `stop_reason` is checked before its content is used. A refusal becomes a clear failure (`AGENT_REFUSED`, escalated to a human), never a silent empty result. Bedrock has no server-side fallback, so we don't depend on it |
+| **Context and cost growth in the tool loop** | Every turn re-sends the whole conversation | Prompt caching on the stable prefix (tools + system prompt + rule files), verified via `cache_read_input_tokens` in the ledger. Large file reads are capped and paged |
+| **Provider outages** | Required failure scenario F5 | The router retries with backoff on 429, 5xx and timeouts, then falls back through `llm.fallback_order`, then returns a retryable error that Temporal retries. The full `PAUSED_PROVIDER` state with a resume signal stays in Phase 3 as planned |
+
+#### Scope
+**Must:**
+1. **LLM router** (`internal/llm`). One `Complete(ctx, Request) (Response, error)` with providers `anthropic` (first-party API, Go SDK `anthropic-sdk-go/v2`), `bedrock` (Mantle client, India profile) and `replay` (cassettes). It handles retry and backoff with typed errors (429, 5xx, 529, timeouts), fallback order, budget checks, the kill-switch check, the prompt data filter, refusal handling, and usage and cost accounting. Model IDs, effort, `max_tokens`, endpoint and region all come from config.
+2. **Prompt data filter** (`internal/dlp`). Redacts card numbers (Luhn-checked), Aadhaar numbers (Verhoeff-checked), secrets (the same patterns as the secrets gate) and emails and phone numbers from **every outgoing message**, and records counts (not values) in the ledger.
+3. **Tool gateway** (`internal/gateway`). The only way an agent touches the repo. Tools are `strict: true`:
+   - `list_files`, `read_file` (paged), `search_code` (Go regexp, capped)
+   - `edit_file` (exact string replace), `create_file`
+   - `run_tests` (sandboxed pytest, summary only, capped number of calls)
+   - `raise_conflict`, `finish`
+
+   Enforcement in code:
+   - paths canonicalised and kept inside the worktree, symlinks resolved, `.git/` refused
+   - **protected paths can never be written**
+   - out-of-scope writes are refused with a message pointing to `raise_conflict`
+   - **edits require reading the file first** (the WebMCP progressive-disclosure pattern)
+   - size caps, a per-attempt call cap, and loop detection (the same call hash 3 times stops the attempt)
+   - every call is audited to the ledger
+4. **Agents** (`internal/agents/llm`), each with a versioned prompt file under `prompts/`, whose hash is recorded per step:
+   - **Analyst:** one structured-output call. Input: requirement, README, `.agent-rules.md`, repo file list. Output: `RequirementSpec`.
+   - **Architect:** read-only tool loop plus a deterministic **Python import graph** (computed in the sandbox with `ast`), ending with structured output: `ArchitecturePlan`. Code then checks the plan: planned paths must exist or sit in existing directories. A plan that **needs a protected file** stops the run as `ESCALATED_HUMAN` for design approval.
+   - **Developer:** tool loop in the run's worktree. Attempt 1 starts from the base; later attempts continue from the previous attempt's commit, with the redacted gate diagnostics. The change becomes the attempt's commit through the existing idempotent path.
+   - **Release:** one structured-output call writing only the human summary and risks. Hashes, scorecard, evidence and SHAs stay computed in code, so the model can't alter them.
+5. **Ledger migration 0002:** `llm_calls` (role, provider, model, input/output/cache tokens, latency, cost, stop reason, DLP counts, prompt hash; no prompt text), `tool_calls` (tool, args hash, allowed, denial reason, duration), `kill_switch`. All tenant-scoped with RLS, as before.
+6. **Kill switch:** `aegis-ctl kill [-tenant t]` cancels running workflows (they end `KILLED`), sets the switch so new runs are refused, and makes the router refuse further model calls immediately. `aegis-ctl unkill` reverses it, and both actions are audited.
+7. **Config additions:**
+   - `agents.mode: stub|llm`
+   - `agents.max_tool_calls`, `agents.max_read_bytes`, `agents.max_run_tests`, `agents.prompts_dir`
+   - `llm.providers[].kind` (`anthropic|bedrock|replay`), `region`, `cassette_dir`
+   - per-role `effort` and `max_tokens`
+   - `data_residency.exceptions[]`
+8. **Scenarios for live agents:** `live-happy` (the Demo 1 requirement, no patches; expect `APPROVED`) and `live-protected` (the requirement also asks to raise the payout threshold; expect a gateway denial and `BLOCKED_SCOPE` or `ESCALATED_HUMAN`, with the protected file untouched).
+
+**Should:** OpenTelemetry GenAI spans for model and tool calls (otherwise Phase 4); a per-run cost line printed by `aegis-run`.
+
+**Not in Phase 2:** `PAUSED_PROVIDER` + resume (Phase 3), maker-checker (Phase 3), the web app (Phase 4).
+
+#### How it plugs into Phase 1
+| Phase 1 piece | Phase 2 change |
+|---|---|
+| `agents.Agents` interface | Adds an LLM implementation. The worker picks stub or LLM from `agents.mode`. Stubs stay for CI and the six deterministic scenarios |
+| `Develop` activity | `DevelopOutput` gains `Onto` ("base" for stubs, "head" for incremental LLM attempts). The LLM developer edits the worktree; its diff goes through the same `ApplyOnto` + `Aegis-Key` path, so the crash safety carries over |
+| `Release` activity | Calls an optional summariser for the summary and risks text. Everything else is unchanged |
+| `contracts` | Unchanged: still the final check. Plus a generator for simplified model-facing schemas |
+| Config guard | Extended for residency exceptions and provider kinds. Production refuses exceptions |
+| Ledger | Migration 0002. Existing tables unchanged |
+| `aegis-run` | `-mode llm`, and a cost/token summary per run |
+
+#### Exit criteria (`make phase2`)
+1. **Unit:**
+   - router: retry, fallback, budget exceeded, kill switch, refusal, repair then `FAILED_SCHEMA`, cost from price table
+   - data filter: Luhn and Verhoeff positive and negative cases, secrets
+   - gateway: path traversal, symlink escape, `.git/` refused, protected write denied, edit-before-read denied, out-of-scope write denied, loop detection, call caps
+   - residency exceptions: expiry, refused in production
+2. **Replay, offline:** Demo 1 runs end to end on recorded responses, deterministically, with no network, and reaches `APPROVED`.
+3. **Live:** Demo 1 with real Claude agents reaches `APPROVED` **5 runs in a row**. Tokens, cost and cache hits are reported per run.
+4. **Live adversarial:** `live-protected` never writes the payout file. The gateway denial is in the ledger, and the run ends blocked or escalated.
+5. **Kill switch:** killing a live run ends it `KILLED` within seconds, and no model call is recorded after the kill.
+6. **Data filter in practice:** a Luhn-valid test card number planted in a repo file never appears in any outgoing request; checked against the recorded request bodies.
+7. **Residency:** the worker refuses to start with a non-India LLM endpoint unless a valid, unexpired, non-production exception names it.
+
+#### Order of work
+| Hours | A (control plane) | C (agents) |
+|---|---|---|
+| 10–12 | Config + residency exceptions, ledger 0002, kill switch | Router core: anthropic provider, retries, usage and cost, replay provider |
+| 12–15 | Gateway + data filter (unit-tested) | Analyst + Architect (structured outputs, import graph) |
+| 15–17 | `Develop`/`Release` activity changes, `aegis-run -mode llm` | Developer tool loop + Release summariser, prompts |
+| 17–18 | Live runs: record cassettes, 5-in-a-row, adversarial, kill switch | Same |
+
+#### Decisions needed from you before implementation
+1. **Which endpoint for development:** the first-party Claude API under a dev-only residency exception, or Bedrock with the India profile from day one (needs AWS credentials with Bedrock access in ap-south-1)?
+2. **Live-run budget:** live runs spend real money. Phase 2 needs about 10–20 live runs (cassette recording, 5-in-a-row, adversarial, kill test). I'll measure the cost of the first run and report it before continuing; please confirm a ceiling for `budget.per_run_usd` and the total.
+
 ---
 
 ## 11. Demo script (6 minutes)

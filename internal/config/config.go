@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 
@@ -42,6 +44,14 @@ type Config struct {
 	SLO           map[string]float64 `json:"slo,omitempty"`
 	Load          Load               `json:"load,omitempty"`
 	Policy        Policy             `json:"policy,omitempty"`
+	Workspace     Workspace          `json:"workspace"`
+	Temporal      Temporal           `json:"temporal"`
+	Ledger        Ledger             `json:"ledger"`
+	Repos         []Repo             `json:"repos"`
+	Evals         Evals              `json:"evals"`
+
+	// BaseDir is the directory of the config file; relative paths resolve against it.
+	BaseDir string `json:"-"`
 
 	// Hash is the SHA-256 of the canonical JSON form. Every run records it.
 	Hash string `json:"-"`
@@ -114,6 +124,7 @@ type Sandbox struct {
 	TimeoutSeconds int     `json:"timeout_seconds"`
 	WarmPoolSize   int     `json:"warm_pool_size"`
 	Network        string  `json:"network"`
+	MaxOutputBytes int64   `json:"max_output_bytes"`
 }
 
 type Tenant struct {
@@ -136,8 +147,54 @@ type API struct {
 }
 
 type Gates struct {
-	Enabled  []string `json:"enabled"`
-	RulesRef string   `json:"rules_ref"`
+	Enabled         []string `json:"enabled"`
+	Tier1           []string `json:"tier1"`
+	Security        []string `json:"security"`
+	Tier2           []string `json:"tier2"`
+	Parallelism     int      `json:"parallelism"`
+	SemgrepRulesDir string   `json:"semgrep_rules_dir"`
+	RulesRef        string   `json:"rules_ref"`
+}
+
+type Workspace struct {
+	MirrorsDir   string `json:"mirrors_dir"`
+	RunsDir      string `json:"runs_dir"`
+	ArtifactsDir string `json:"artifacts_dir"`
+	AuthorName   string `json:"commit_author_name"`
+	AuthorEmail  string `json:"commit_author_email"`
+}
+
+type Temporal struct {
+	Endpoint  string `json:"endpoint"`
+	Namespace string `json:"namespace"`
+	TaskQueue string `json:"task_queue"`
+	// MaxConcurrentActivities bounds how many activities one worker runs at once.
+	MaxConcurrentActivities int `json:"max_concurrent_activities"`
+	// HeartbeatSeconds bounds how long a dead worker's activity goes unnoticed.
+	HeartbeatSeconds int `json:"heartbeat_seconds"`
+}
+
+type Ledger struct {
+	AdminEndpoint  string `json:"admin_endpoint"`
+	AppEndpoint    string `json:"app_endpoint"`
+	AppRole        string `json:"app_role"`
+	AppPasswordRef string `json:"app_password_ref"`
+}
+
+type Repo struct {
+	Name            string   `json:"name"`
+	Endpoint        string   `json:"endpoint"`
+	Path            string   `json:"path"`
+	DefaultBranch   string   `json:"default_branch"`
+	SourceDirs      []string `json:"source_dirs"`
+	DependencyFiles []string `json:"dependency_files"`
+	OpenAPIExport   []string `json:"openapi_export"`
+}
+
+type Evals struct {
+	HiddenTestsDir string `json:"hidden_tests_dir"`
+	ReplayDir      string `json:"replay_dir"`
+	ScenariosDir   string `json:"scenarios_dir"`
 }
 
 type Load struct {
@@ -183,7 +240,16 @@ func LoadFile(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-	return Parse(raw)
+	cfg, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	abs, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	cfg.BaseDir = abs
+	return cfg, nil
 }
 
 // Parse validates YAML bytes against the schema, then runs the semantic guards.
@@ -269,6 +335,34 @@ func (c *Config) guard() error {
 		tenants[t.ID] = true
 	}
 
+	wantKind := func(field, name, kind string) {
+		e, ok := endpoints[name]
+		switch {
+		case !ok:
+			add("%s references unknown endpoint %q", field, name)
+		case e.Kind != kind:
+			add("%s references endpoint %q of kind %q, want %s", field, name, e.Kind, kind)
+		}
+	}
+	wantKind("temporal.endpoint", c.Temporal.Endpoint, "workflow")
+	wantKind("ledger.admin_endpoint", c.Ledger.AdminEndpoint, "database")
+	wantKind("ledger.app_endpoint", c.Ledger.AppEndpoint, "database")
+	repos := map[string]bool{}
+	for _, r := range c.Repos {
+		if repos[r.Name] {
+			add("repo %q is defined more than once", r.Name)
+		}
+		repos[r.Name] = true
+		wantKind(fmt.Sprintf("repo %q endpoint", r.Name), r.Endpoint, "code_host")
+	}
+	for tier, gates := range map[string][]string{"tier1": c.Gates.Tier1, "security": c.Gates.Security, "tier2": c.Gates.Tier2} {
+		for _, g := range gates {
+			if !slices.Contains(c.Gates.Enabled, g) {
+				add("gates.%s lists %q, which is not in gates.enabled", tier, g)
+			}
+		}
+	}
+
 	if c.Review.RequiredApprovers["protected"] < c.Review.RequiredApprovers["high"] {
 		add("review.required_approvers.protected must be >= high")
 	}
@@ -287,4 +381,83 @@ func (c *Config) Endpoint(name string) (Endpoint, bool) {
 		}
 	}
 	return Endpoint{}, false
+}
+
+// Path resolves a config-relative path to an absolute one.
+func (c *Config) Path(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(c.BaseDir, p)
+}
+
+// Repo returns the named repository.
+func (c *Config) Repo(name string) (Repo, bool) {
+	for _, r := range c.Repos {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return Repo{}, false
+}
+
+// RepoRemote returns the git remote URL for a repo, built from its code_host endpoint.
+// Relative file:// URLs resolve against the config directory.
+func (c *Config) RepoRemote(r Repo) (string, error) {
+	e, ok := c.Endpoint(r.Endpoint)
+	if !ok {
+		return "", fmt.Errorf("repo %q: unknown endpoint %q", r.Name, r.Endpoint)
+	}
+	base := e.URL
+	if rest, ok := strings.CutPrefix(base, "file://"); ok {
+		return filepath.Join(c.Path(rest), r.Path), nil
+	}
+	return strings.TrimRight(base, "/") + "/" + r.Path, nil
+}
+
+// ErrSecretUnavailable is returned when a secret reference cannot be resolved.
+var ErrSecretUnavailable = errors.New("secret unavailable")
+
+// ResolveSecret turns an env:/vault: reference into its value at runtime.
+// Values are never logged or stored.
+func ResolveSecret(ref string) (string, error) {
+	switch {
+	case strings.HasPrefix(ref, "env:"):
+		name := strings.TrimPrefix(ref, "env:")
+		v, ok := os.LookupEnv(name)
+		if !ok || v == "" {
+			return "", fmt.Errorf("%w: environment variable %s is not set", ErrSecretUnavailable, name)
+		}
+		return v, nil
+	case strings.HasPrefix(ref, "vault:"):
+		return "", fmt.Errorf("%w: vault references are not supported yet (%s)", ErrSecretUnavailable, ref)
+	default:
+		return "", fmt.Errorf("%w: unsupported reference %q", ErrSecretUnavailable, ref)
+	}
+}
+
+// DSN builds a Postgres connection string for a database endpoint, with the
+// password taken from the endpoint's credentials_ref.
+func (c *Config) DSN(endpoint string) (string, error) {
+	e, ok := c.Endpoint(endpoint)
+	if !ok || e.Kind != "database" {
+		return "", fmt.Errorf("no database endpoint %q", endpoint)
+	}
+	u, err := url.Parse(e.URL)
+	if err != nil {
+		return "", fmt.Errorf("endpoint %q: %w", endpoint, err)
+	}
+	if e.CredentialsRef != "" {
+		pw, err := ResolveSecret(e.CredentialsRef)
+		if err != nil {
+			return "", err
+		}
+		u.User = url.UserPassword(u.User.Username(), pw)
+	}
+	q := u.Query()
+	if q.Get("sslmode") == "" && c.Deployment.Environment == "local" {
+		q.Set("sslmode", "disable")
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }

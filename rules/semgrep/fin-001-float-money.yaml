@@ -1,0 +1,31 @@
+rules:
+  - id: fin-001-float-money
+    languages: [python]
+    severity: ERROR
+    message: "FIN-001: money must be integer paise or Decimal, never float."
+    metadata: { fin_id: FIN-001, confidence: HIGH }
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: $X = float(...)
+              - pattern: "$X: float = $V"
+              - pattern: "$X: float"
+          - metavariable-regex:
+              metavariable: $X
+              regex: (?i).*(amount|fee|balance|payout|settle|price|total|paise|rupee).*
+      - patterns:
+          - pattern: float($E)
+          - metavariable-regex:
+              metavariable: $E
+              regex: (?i).*(amount|fee|balance|payout|settle|price|total|paise|rupee).*
+      - patterns:
+          - pattern-either:
+              - pattern: $X = $A * $F
+              - pattern: $X = $F * $A
+              - pattern: $X = $F
+          - metavariable-regex:
+              metavariable: $X
+              regex: (?i).*(amount|fee|balance|payout|settle|price|total|paise|rupee).*
+          - metavariable-regex:
+              metavariable: $F
+              regex: ^[0-9]*\.[0-9]+$

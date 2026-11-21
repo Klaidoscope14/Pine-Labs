@@ -44,7 +44,7 @@ sample-test: build ## Lint, unit tests and live smoke test inside the locked-dow
 
 hidden-test: build ## Hidden oracle tests must FAIL on the base code (proves the planted bug)
 	@if docker run --rm $(SANDBOX_ARGS) -v $(SAMPLE):/work:ro -v $(HIDDEN):/hidden:ro -e PYTHONPATH=/work \
-	    $(SANDBOX_IMAGE) pytest -p tests.conftest /hidden --rootdir=/work -q; then \
+	    $(SANDBOX_IMAGE) pytest /hidden -c /hidden/pytest.ini --rootdir=/hidden; then \
 	  echo "UNEXPECTED: hidden tests passed on base code"; exit 1; \
 	else echo "hidden tests fail on base code, as expected"; fi
 
@@ -64,3 +64,42 @@ health:
 
 down: ## Stop the stack (keeps volumes)
 	$(COMPOSE) down
+
+# ---------------- Phase 1 ----------------
+SECRETS_ENV = set -a; source deploy/compose/.env.secrets; set +a;
+LOGS = .data/logs
+
+.PHONY: phase1 semgrep-test gate-test ledger-test migrate seed-repo worker run run-all crash-test ledger-verify
+
+phase1: test semgrep-test gate-test ledger-test migrate seed-repo run-all crash-test ledger-verify ## Every Phase 1 exit check
+
+semgrep-test: build ## FIN rule pack: positive and negative cases
+	docker run --rm $(SANDBOX_ARGS) --mount type=bind,source=$(CURDIR)/rules/semgrep,target=/rules,readonly \
+	  $(SANDBOX_IMAGE) semgrep scan --test --metrics off --disable-version-check /rules
+
+gate-test: build ## Every gate, for real in the sandbox, on base code and each scenario patch
+	AEGIS_SANDBOX_IMAGE=$(SANDBOX_IMAGE) go test ./internal/gaterun ./internal/sandbox -count=1 -timeout 20m
+
+ledger-test: ## Ledger against Postgres: RLS, append-only audit, chain tamper detection, Once()
+	$(SECRETS_ENV) go test ./internal/ledger -count=1
+
+migrate: build ## Create/update the app role and ledger schema
+	$(SECRETS_ENV) bin/aegis-ledger -config $(CONFIG) migrate
+
+seed-repo: build ## Create the local code-host repo from the sample
+	scripts/seed-repo.sh $(CONFIG) $(SAMPLE)
+
+worker: build ## Run a worker in the foreground
+	$(SECRETS_ENV) bin/aegis-worker -config $(CONFIG)
+
+run: build ## Run one scenario against a running worker: make run S=happy
+	$(SECRETS_ENV) bin/aegis-run -config $(CONFIG) -scenario $(S)
+
+run-all: build ## Start a worker, run all six scenarios concurrently, verify outcomes
+	@$(SECRETS_ENV) scripts/run-all.sh $(CONFIG) $(LOGS)
+
+crash-test: build ## Kill the worker mid-run; the run must finish with no duplicates
+	@$(SECRETS_ENV) scripts/crash-test.sh $(CONFIG) $(LOGS)
+
+ledger-verify: build ## Verify every tenant's audit chain
+	$(SECRETS_ENV) bin/aegis-ledger -config $(CONFIG) verify

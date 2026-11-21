@@ -1,0 +1,6 @@
+name: happy
+description: Correct idempotent fix on the first attempt.
+tenant: payments-team
+attempts: [attempt-1.patch]
+approve: true
+expect: { status: APPROVED, attempts: 1 }

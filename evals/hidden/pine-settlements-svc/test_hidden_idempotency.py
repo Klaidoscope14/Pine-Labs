@@ -1,13 +1,9 @@
 """HIDDEN ORACLE TESTS. Never mounted where agents can read them.
 
-These define "done" for the duplicate-webhook ticket. They fail on the base code.
+They define "done" for the duplicate-webhook ticket and fail on the base code.
 """
 
-import json
 import threading
-from pathlib import Path
-
-REPO = Path(__file__).resolve().parent
 
 
 def _event(event_id="evt_dup", merchant="m_dup", amount=50_000):
@@ -32,11 +28,7 @@ def test_concurrent_duplicates_credit_once(client, send_webhook):
     assert client.get("/merchants/m_race/balance").json()["balance_paise"] == 50_000
 
 
-def test_replay_fixture_matches_expected_balances(client, send_webhook):
-    lines = Path("fixtures/webhook_replay.jsonl").read_text().splitlines()
-    for line in lines:
-        send_webhook(json.loads(line))
-    expected = json.loads(Path("fixtures/replay_expected.json").read_text())
-    for merchant, balance in expected.items():
-        got = client.get(f"/merchants/{merchant}/balance").json()["balance_paise"]
-        assert got == balance, f"{merchant}: ledger {got} != expected {balance}"
+def test_distinct_events_still_credit(client, send_webhook):
+    send_webhook(_event("evt_a", "m_both"))
+    send_webhook(_event("evt_b", "m_both"))
+    assert client.get("/merchants/m_both/balance").json()["balance_paise"] == 100_000

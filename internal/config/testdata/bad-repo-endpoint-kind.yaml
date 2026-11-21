@@ -1,0 +1,91 @@
+# Local development config. No secrets: every credential is an env:/vault: reference.
+# "local-*" regions stand in for the operator-chosen Indian regions in real deployments.
+version: 1
+
+deployment:
+  environment: local
+  primary_region: local-primary
+  dr_region: local-dr
+
+data_residency:
+  allowed_jurisdictions: [IN]
+
+endpoints:
+  - { name: postgres-admin, kind: database,     url: "postgres://aegis@127.0.0.1:5432/aegis", jurisdiction: IN, credentials_ref: env:POSTGRES_PASSWORD }
+  - { name: postgres,     kind: database,       url: "postgres://aegis_app@127.0.0.1:5432/aegis", jurisdiction: IN, credentials_ref: env:AEGIS_APP_DB_PASSWORD }
+  - { name: temporal,     kind: workflow,       url: "127.0.0.1:7233",        jurisdiction: IN }
+  - { name: nats,         kind: events,         url: "nats://127.0.0.1:4222", jurisdiction: IN }
+  - { name: artifacts,    kind: object_storage, url: "http://127.0.0.1:8333", jurisdiction: IN, credentials_ref: env:AEGIS_S3_CREDENTIALS }
+  - { name: backups,      kind: backup,         url: "file://./.data/backups", jurisdiction: IN }
+  - { name: otel,         kind: telemetry,      url: "127.0.0.1:4317",        jurisdiction: IN }
+  - { name: egress-proxy, kind: egress_proxy,   url: "127.0.0.1:4750",        jurisdiction: IN }
+  - { name: code-host,    kind: code_host,      url: "file://./.data/git",    jurisdiction: IN }
+  - { name: llm-fake,     kind: llm,            url: "http://127.0.0.1:9900", jurisdiction: IN }
+
+llm:
+  providers:
+    - name: fake
+      endpoint: llm-fake
+      api_key_ref: env:AEGIS_LLM_FAKE_KEY
+      models: { analyst: fake-small, architect: fake-large, developer: fake-large, release: fake-small }
+  fallback_order: [fake]
+
+workflow: { max_ci_rounds: 2, max_schema_repairs: 2, max_arbitration_rounds: 1 }
+budget: { per_run_tokens: 2000000, per_run_usd: 5, per_tenant_daily_usd: 100 }
+review:
+  wip_per_reviewer: 2
+  required_approvers: { low: 1, high: 2, protected: 2 }
+scope:
+  protected_paths: ["app/config/payout_auth.py", ".agent-rules.md", ".github/**", "protected_paths.yaml"]
+  diff_budget: { files: 8, lines: 400 }
+  lease_ttl_seconds: 1800
+sandbox:
+  image: aegis-sandbox:dev
+  cpus: 1
+  memory_mb: 1024
+  pids: 256
+  timeout_seconds: 600
+  warm_pool_size: 2
+  network: none
+  max_output_bytes: 4194304
+tenants:
+  - { id: payments-team,    concurrency: 4, queue_priority: high,   daily_usd: 50 }
+  - { id: settlements-team, concurrency: 4, queue_priority: normal, daily_usd: 50 }
+tokens: { capability_ttl_seconds: 900 }
+approval: { expiry_seconds: 86400 }
+api: { listen: "127.0.0.1:8480" }
+gates:
+  enabled: [scope, lint, tests, hidden_tests, semgrep, bandit, secrets, dependencies, openapi, replay]
+  tier1: [scope, lint, tests]
+  security: [semgrep, bandit, secrets, dependencies]
+  tier2: [hidden_tests, openapi, replay]
+  parallelism: 3
+  semgrep_rules_dir: rules/semgrep
+  rules_ref: fin-rules-v0
+workspace:
+  mirrors_dir: .data/mirrors
+  runs_dir: .data/runs
+  artifacts_dir: .data/artifacts
+  commit_author_name: aegis-agent
+  commit_author_email: aegis-agent@aegis.invalid
+temporal: { endpoint: temporal, namespace: default, task_queue: aegis-runs, max_concurrent_activities: 16, heartbeat_seconds: 20 }
+ledger:
+  admin_endpoint: postgres-admin
+  app_endpoint: postgres
+  app_role: aegis_app
+  app_password_ref: env:AEGIS_APP_DB_PASSWORD
+repos:
+  - name: pine-settlements-svc
+    endpoint: postgres
+    path: pine-settlements-svc.git
+    default_branch: main
+    source_dirs: [app]
+    dependency_files: [requirements.txt, requirements-dev.txt, requirements.lock, pyproject.toml]
+    openapi_export: [python, scripts/export_openapi.py]
+evals:
+  hidden_tests_dir: evals/hidden/pine-settlements-svc
+  replay_dir: evals/replay/pine-settlements-svc
+  scenarios_dir: evals/scenarios
+slo: {}
+load: { concurrent_runs: 50 }
+policy: { bundle_ref: approvals-v0 }

@@ -1,0 +1,5 @@
+name: design-conflict
+description: The developer reports the plan cannot be implemented within scope.
+tenant: payments-team
+developer_result: developer_result.json
+expect: { status: ESCALATED_HUMAN, attempts: 1 }

@@ -40,14 +40,16 @@ func TestConfigHashIsStable(t *testing.T) {
 // Each bad fixture must be rejected, and the error must mention why.
 func TestBadConfigsAreRejected(t *testing.T) {
 	want := map[string]string{
-		"bad-jurisdiction.yaml":      "not in data_residency.allowed_jurisdictions",
-		"bad-untagged.yaml":          "jurisdiction",
-		"bad-plaintext-secret.yaml":  "api_key_ref",
-		"bad-same-region.yaml":       "dr_region must differ",
-		"bad-sandbox-network.yaml":   "network",
-		"bad-llm-endpoint-kind.yaml": "want llm",
-		"bad-unknown-fallback.yaml":  "unknown provider",
-		"bad-unknown-key.yaml":       "surprise_key",
+		"bad-jurisdiction.yaml":       "not in data_residency.allowed_jurisdictions",
+		"bad-untagged.yaml":           "jurisdiction",
+		"bad-plaintext-secret.yaml":   "api_key_ref",
+		"bad-same-region.yaml":        "dr_region must differ",
+		"bad-sandbox-network.yaml":    "network",
+		"bad-llm-endpoint-kind.yaml":  "want llm",
+		"bad-unknown-fallback.yaml":   "unknown provider",
+		"bad-unknown-key.yaml":        "surprise_key",
+		"bad-tier-not-enabled.yaml":   "not in gates.enabled",
+		"bad-repo-endpoint-kind.yaml": "want code_host",
 	}
 	files, err := filepath.Glob("testdata/bad-*.yaml")
 	if err != nil {
@@ -70,5 +72,48 @@ func TestBadConfigsAreRejected(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, want[name])
 			}
 		})
+	}
+}
+
+func TestResolveSecret(t *testing.T) {
+	t.Setenv("AEGIS_TEST_SECRET", "s3cret")
+	if v, err := ResolveSecret("env:AEGIS_TEST_SECRET"); err != nil || v != "s3cret" {
+		t.Fatalf("got %q, %v", v, err)
+	}
+	if _, err := ResolveSecret("env:AEGIS_DEFINITELY_UNSET"); !errors.Is(err, ErrSecretUnavailable) {
+		t.Errorf("unset env should be unavailable, got %v", err)
+	}
+	if _, err := ResolveSecret("plain-value"); err == nil {
+		t.Error("plain values must be rejected")
+	}
+}
+
+func TestDSNUsesSecretRef(t *testing.T) {
+	t.Setenv("AEGIS_APP_DB_PASSWORD", "p@ss/word")
+	cfg, err := LoadFile("testdata/good.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn, err := cfg.DSN("postgres")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(dsn, "aegis_app:p%40ss%2Fword@") || !strings.Contains(dsn, "sslmode=disable") {
+		t.Errorf("unexpected DSN %q", dsn)
+	}
+}
+
+func TestRepoRemoteResolvesFileURL(t *testing.T) {
+	cfg, err := LoadFile("testdata/good.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, _ := cfg.Repo("pine-settlements-svc")
+	remote, err := cfg.RepoRemote(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(remote) || !strings.HasSuffix(remote, ".data/git/pine-settlements-svc.git") {
+		t.Errorf("unexpected remote %q", remote)
 	}
 }

@@ -1,0 +1,6 @@
+name: self-heal
+description: Attempt 1 uses float for money (FIN-001); attempt 2 fixes it.
+tenant: payments-team
+attempts: [attempt-1.patch, attempt-2.patch]
+approve: true
+expect: { status: APPROVED, attempts: 2, resolved_rule: FIN-001 }

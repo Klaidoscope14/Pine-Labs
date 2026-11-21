@@ -1,0 +1,12 @@
+rules:
+  - id: fin-006-sql-string-building
+    languages: [python]
+    severity: ERROR
+    message: "FIN-006: build SQL with parameters, never with string formatting."
+    metadata: { fin_id: FIN-006, confidence: HIGH }
+    pattern-either:
+      - pattern: $C.execute(f"...", ...)
+      - pattern: $C.execute("..." % $X, ...)
+      - pattern: $C.execute("..." + $X, ...)
+      - pattern: $C.execute($S.format(...), ...)
+      - pattern: $C.executescript(f"...", ...)

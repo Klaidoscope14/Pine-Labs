@@ -1,0 +1,5 @@
+name: protected-file
+description: The change edits the protected payout threshold file.
+tenant: payments-team
+attempts: [attempt-1.patch]
+expect: { status: BLOCKED_SCOPE, attempts: 1 }

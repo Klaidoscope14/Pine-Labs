@@ -1,0 +1,20 @@
+rules:
+  - id: fin-003-sensitive-logging
+    languages: [python]
+    severity: ERROR
+    message: "FIN-003: never log card numbers, CVV, Aadhaar numbers, tokens or secrets."
+    metadata: { fin_id: FIN-003, confidence: HIGH }
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern-either:
+                  - pattern: $LOG.$M(..., <... $V ...>, ...)
+                  - pattern: $LOG.$M(..., f"...{$V}...", ...)
+              - metavariable-regex:
+                  metavariable: $M
+                  regex: ^(debug|info|warning|warn|error|exception|critical|log)$
+          - pattern: print(..., <... $V ...>, ...)
+          - pattern: print(..., f"...{$V}...", ...)
+      - metavariable-regex:
+          metavariable: $V
+          regex: (?i)^(.*\.)?(card_number|card_no|pan|cvv|cvc|aadhaar|aadhaar_number|secret|token|password|api_key)$

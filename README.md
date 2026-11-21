@@ -43,3 +43,34 @@ That runs every Phase 0 exit check in order:
 
 Configuration: `config.example.yaml` documents every setting with placeholders.
 `config.local.yaml` is for local development.
+
+## Phase 1: deterministic core
+
+The full workflow runs end to end with stub agents that replay hand-written
+patches (`evals/scenarios/`). Every gate, the scope checker, the ledger and the
+Temporal workflow are real.
+
+```bash
+make up          # stack (once)
+make phase1      # every Phase 1 exit check
+```
+
+| Target | Proves |
+|---|---|
+| `make semgrep-test` | FIN-001/003/004/006 rules hit what they should and nothing else |
+| `make gate-test` | Every gate, in the sandbox, on the base code and on each scenario patch |
+| `make ledger-test` | Tenant isolation (RLS), append-only audit log, tamper detection, `Once()` |
+| `make migrate` / `make seed-repo` | Ledger schema + app role; local code-host repo from the sample |
+| `make run-all` | All six scenarios at once on a live worker reach their expected end state |
+| `make crash-test` | `kill -9` the worker mid-run; the run finishes with no duplicate commits or steps |
+| `make ledger-verify` | Every tenant's audit chain verifies |
+
+Run one scenario against a worker you started with `make worker`:
+
+```bash
+make run S=self-heal
+```
+
+Inspect a run: `bin/aegis-ledger -config config.local.yaml show -tenant <tenant> -run <run-id>`
+(needs the secrets in the environment, as the make targets do). Gate reports,
+the final diff and the release packet are under `.data/artifacts/runs/<run-id>/`.

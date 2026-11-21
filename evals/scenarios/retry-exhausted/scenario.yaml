@@ -1,0 +1,5 @@
+name: retry-exhausted
+description: Every attempt breaks an existing test.
+tenant: settlements-team
+attempts: [attempt-1.patch]
+expect: { status: HALTED_RETRY_EXHAUSTED, attempts: 2 }

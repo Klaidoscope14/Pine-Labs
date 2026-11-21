@@ -1,0 +1,27 @@
+rules:
+  - id: fin-004-missing-idempotency
+    languages: [python]
+    severity: WARNING
+    message: >-
+      FIN-004: this POST handler moves money without an idempotency key or
+      duplicate-event check. Retried deliveries could credit twice.
+    metadata: { fin_id: FIN-004, confidence: MEDIUM }
+    patterns:
+      - pattern-either:
+          - pattern: |
+              @$R.post(...)
+              def $F(...):
+                  $...BODY
+          - pattern: |
+              @$R.post(...)
+              async def $F(...):
+                  $...BODY
+      - metavariable-pattern:
+          metavariable: $...BODY
+          patterns:
+            - pattern: $STORE.credit(...)
+      - metavariable-pattern:
+          metavariable: $...BODY
+          patterns:
+            - pattern-not-regex: (?i)(idempot|processed_event|dedup|already_processed|insert\s+or\s+ignore|on\s+conflict)
+            - pattern-regex: (?s).+

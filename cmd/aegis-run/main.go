@@ -1,0 +1,221 @@
+// Command aegis-run starts scenario runs and checks they end as expected.
+//
+//	aegis-run -config c.yaml -scenario happy        # one scenario, wait, verify
+//	aegis-run -config c.yaml -scenario all          # every scenario concurrently
+//	aegis-run -config c.yaml -scenario happy -detach  # print the run id and exit
+//	aegis-run -config c.yaml -follow <run-id> -scenario happy  # resume following a run
+package main
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"os/user"
+	"sort"
+	"strings"
+	"sync"
+	"text/tabwriter"
+	"time"
+
+	"go.temporal.io/sdk/client"
+
+	"aegis/internal/app"
+	"aegis/internal/config"
+	"aegis/internal/ledger"
+	"aegis/internal/scenario"
+	"aegis/internal/workflow"
+)
+
+type result struct {
+	scenario string
+	runID    string
+	tenant   string
+	out      workflow.Outcome
+	problems []string
+}
+
+func main() {
+	path := flag.String("config", os.Getenv("AEGIS_CONFIG"), "config file")
+	name := flag.String("scenario", "", "scenario name, or 'all'")
+	detach := flag.Bool("detach", false, "start the run, print its id, and exit")
+	follow := flag.String("follow", "", "follow an existing run id instead of starting one")
+	timeout := flag.Duration("timeout", 30*time.Minute, "overall timeout")
+	flag.Parse()
+	log := app.Logger()
+	cfg, err := config.LoadFile(*path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	root := cfg.Path(cfg.Evals.ScenariosDir)
+	names := []string{*name}
+	if *name == "all" {
+		if names, err = scenario.All(root); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	c, err := app.Temporal(cfg, log)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer c.Close()
+	store, err := app.Ledger(ctx, cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defer store.Close()
+
+	reviewer := "cli"
+	if u, err := user.Current(); err == nil {
+		reviewer = "cli:" + u.Username
+	}
+	var mu sync.Mutex
+	var results []result
+	var wg sync.WaitGroup
+	for _, n := range names {
+		s, err := scenario.Load(root, n)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := runOne(ctx, cfg, c, store, s, *follow, *detach, reviewer)
+			mu.Lock()
+			results = append(results, r)
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if *detach {
+		return
+	}
+	sort.Slice(results, func(i, j int) bool { return results[i].scenario < results[j].scenario })
+	tw := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "SCENARIO\tRUN\tSTATUS\tATTEMPTS\tRESULT")
+	failed := false
+	for _, r := range results {
+		verdict := "ok"
+		if len(r.problems) > 0 {
+			verdict = "FAIL: " + strings.Join(r.problems, "; ")
+			failed = true
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%s\n", r.scenario, r.runID, r.out.Status, r.out.Attempts, verdict)
+	}
+	tw.Flush()
+	tenants := map[string]bool{}
+	for _, r := range results {
+		tenants[r.tenant] = true
+	}
+	for t := range tenants {
+		n, err := store.Verify(ctx, t)
+		if err != nil {
+			fmt.Printf("audit chain %s: BROKEN: %v\n", t, err)
+			failed = true
+		} else {
+			fmt.Printf("audit chain %s: verified (%d events)\n", t, n)
+		}
+	}
+	if failed {
+		os.Exit(1)
+	}
+}
+
+func newRunID(s string) string {
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%s-%s", s, hex.EncodeToString(b))
+}
+
+func runOne(ctx context.Context, cfg *config.Config, c client.Client, store *ledger.Store, s scenario.Scenario,
+	follow string, detach bool, reviewer string) result {
+	res := result{scenario: s.Name, tenant: s.Tenant}
+	fail := func(format string, args ...any) result {
+		res.problems = append(res.problems, fmt.Sprintf(format, args...))
+		return res
+	}
+	repo := cfg.Repos[0].Name
+	if follow == "" {
+		requirement, err := s.Common(cfg.Path(cfg.Evals.ScenariosDir), "requirement.txt")
+		if err != nil {
+			return fail("read requirement: %v", err)
+		}
+		res.runID = newRunID(s.Name)
+		in := workflow.Input{RunID: res.runID, TenantID: s.Tenant, Repo: repo,
+			Requirement: strings.TrimSpace(string(requirement)), Scenario: s.Name,
+			ConfigHash: cfg.Hash, Settings: app.Settings(cfg)}
+		if _, err := c.ExecuteWorkflow(ctx, client.StartWorkflowOptions{ID: res.runID, TaskQueue: cfg.Temporal.TaskQueue},
+			app.WorkflowName, in); err != nil {
+			return fail("start: %v", err)
+		}
+		if detach {
+			fmt.Println(res.runID)
+			return res
+		}
+	} else {
+		res.runID = follow
+	}
+
+	// Act as the human reviewer when the scenario says to approve.
+	signaled := false
+	for {
+		resp, err := c.QueryWorkflow(ctx, res.runID, "", workflow.QueryState)
+		var st workflow.State
+		if err == nil && resp.Get(&st) == nil {
+			if st.Status == workflow.AwaitingHuman && s.Approve && !signaled {
+				if err := c.SignalWorkflow(ctx, res.runID, "", workflow.SignalDecision,
+					workflow.Decision{Approve: true, Reviewer: reviewer, Note: "scenario auto-approval"}); err != nil {
+					return fail("signal: %v", err)
+				}
+				signaled = true
+			}
+		}
+		desc, err := c.DescribeWorkflowExecution(ctx, res.runID, "")
+		if err == nil && desc.WorkflowExecutionInfo.GetCloseTime() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return fail("timed out waiting for the run")
+		case <-time.After(time.Second):
+		}
+	}
+	if err := c.GetWorkflow(ctx, res.runID, "").Get(ctx, &res.out); err != nil {
+		return fail("run failed: %v", err)
+	}
+	if string(res.out.Status) != s.Expect.Status {
+		fail("status %s, expected %s (%s)", res.out.Status, s.Expect.Status, res.out.Reason)
+	}
+	if s.Expect.Attempts > 0 && res.out.Attempts != s.Expect.Attempts {
+		fail("attempts %d, expected %d", res.out.Attempts, s.Expect.Attempts)
+	}
+	sum, err := store.Summary(ctx, s.Tenant, res.runID)
+	if err != nil {
+		return fail("ledger: %v", err)
+	}
+	if sum.Run.Status != string(res.out.Status) {
+		fail("ledger status %s disagrees with workflow %s", sum.Run.Status, res.out.Status)
+	}
+	if s.Expect.ResolvedRule != "" && !resolved(sum, s.Expect.ResolvedRule) {
+		fail("finding %s was not marked RESOLVED", s.Expect.ResolvedRule)
+	}
+	return res
+}
+
+func resolved(sum ledger.Summary, rule string) bool {
+	for _, f := range sum.Findings {
+		if strings.HasPrefix(f["rule_id"].(string), rule) && f["status"] == "RESOLVED" {
+			return true
+		}
+	}
+	return false
+}

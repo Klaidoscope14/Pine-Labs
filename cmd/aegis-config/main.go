@@ -4,6 +4,7 @@
 //	aegis-config validate <file>
 //	aegis-config sandbox-args <file>   # hardened `docker run` flags
 //	aegis-config sandbox-image <file>
+//	aegis-config repo-remote <file>    # git remote of the first configured repo
 package main
 
 import (
@@ -16,7 +17,7 @@ import (
 )
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: aegis-config validate|sandbox-args|sandbox-image <file>")
+	fmt.Fprintln(os.Stderr, "usage: aegis-config validate|sandbox-args|sandbox-image|repo-remote <file>")
 	os.Exit(2)
 }
 
@@ -43,6 +44,13 @@ func main() {
 		fmt.Println(strings.Join(args, " "))
 	case "sandbox-image":
 		fmt.Println(cfg.Sandbox.Image)
+	case "repo-remote":
+		remote, err := cfg.RepoRemote(cfg.Repos[0])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(remote)
 	default:
 		usage()
 	}
