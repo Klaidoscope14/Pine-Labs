@@ -6,3 +6,8 @@ agents:
   mode: llm
 llm:
   fallback_order: [bedrock-india]
+# Approved live budget for Phase 2: $30 in total (all live scenarios run as
+# payments-team, so the tenant's 24-hour cap enforces it), at most $5 per run.
+budget:
+  per_run_usd: 5
+  per_tenant_daily_usd: 30
