@@ -1,0 +1,29 @@
+{
+  "clarified_summary": "Duplicate webhook deliveries must not credit a merchant's settlement balance more than once.",
+  "assumptions": [
+    "event_id is unique per provider event"
+  ],
+  "acceptance_criteria": [
+    {
+      "id": "AC-1",
+      "description": "A webhook delivered twice with the same event_id credits the ledger once.",
+      "verification_type": "unit_test",
+      "must": true
+    },
+    {
+      "id": "AC-2",
+      "description": "Concurrent duplicate deliveries credit the ledger once.",
+      "verification_type": "replay",
+      "must": true
+    }
+  ],
+  "task_plan": [
+    {
+      "id": "T-1",
+      "description": "Record processed event_ids with a unique constraint and check before crediting."
+    }
+  ],
+  "risk_flags": [
+    "Touches money movement"
+  ]
+}

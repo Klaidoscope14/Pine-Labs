@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aegis://schemas/config.schema.json",
+  "title": "AegisSDLC configuration",
+  "description": "Single source of every region, endpoint, model, limit and threshold. Nothing of this kind may be hardcoded in services.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "deployment", "data_residency", "endpoints", "llm", "workflow", "budget", "review", "scope", "sandbox", "tenants", "tokens", "approval", "api", "gates"],
+  "$defs": {
+    "secretRef": {
+      "description": "Secrets are never stored in config. Only references to an environment variable or a vault path are allowed.",
+      "type": "string",
+      "pattern": "^(env:[A-Z][A-Z0-9_]*|vault:[A-Za-z0-9_./-]+)$"
+    },
+    "jurisdiction": { "type": "string", "pattern": "^[A-Z]{2}$" },
+    "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+    "positiveInt": { "type": "integer", "minimum": 1 },
+    "role": { "enum": ["analyst", "architect", "developer", "release"] }
+  },
+  "properties": {
+    "version": { "const": 1 },
+    "deployment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["environment", "primary_region", "dr_region"],
+      "properties": {
+        "environment": { "enum": ["local", "staging", "production"] },
+        "primary_region": { "type": "string", "minLength": 1 },
+        "dr_region": { "type": "string", "minLength": 1 }
+      }
+    },
+    "data_residency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_jurisdictions"],
+      "properties": {
+        "allowed_jurisdictions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/jurisdiction" }
+        }
+      }
+    },
+    "endpoints": {
+      "description": "Every place data can go: databases, storage, backups, logs, telemetry, LLM APIs. Each one must declare its jurisdiction.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "kind", "url", "jurisdiction"],
+        "properties": {
+          "name": { "$ref": "#/$defs/name" },
+          "kind": { "enum": ["database", "workflow", "events", "object_storage", "backup", "telemetry", "logs", "llm", "code_host", "egress_proxy"] },
+          "url": { "type": "string", "minLength": 1 },
+          "jurisdiction": { "$ref": "#/$defs/jurisdiction" },
+          "credentials_ref": { "$ref": "#/$defs/secretRef" }
+        }
+      }
+    },
+    "llm": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providers", "fallback_order"],
+      "properties": {
+        "providers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "endpoint", "api_key_ref", "models"],
+            "properties": {
+              "name": { "$ref": "#/$defs/name" },
+              "endpoint": { "$ref": "#/$defs/name", "description": "Name of an entry in endpoints[] with kind llm." },
+              "api_key_ref": { "$ref": "#/$defs/secretRef" },
+              "models": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["analyst", "architect", "developer", "release"],
+                "properties": {
+                  "analyst": { "type": "string", "minLength": 1 },
+                  "architect": { "type": "string", "minLength": 1 },
+                  "developer": { "type": "string", "minLength": 1 },
+                  "release": { "type": "string", "minLength": 1 }
+                }
+              },
+              "price_table_ref": { "type": "string" }
+            }
+          }
+        },
+        "fallback_order": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/name" }
+        }
+      }
+    },
+    "workflow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_ci_rounds", "max_schema_repairs", "max_arbitration_rounds"],
+      "properties": {
+        "max_ci_rounds": { "type": "integer", "minimum": 1, "maximum": 5 },
+        "max_schema_repairs": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "max_arbitration_rounds": { "type": "integer", "minimum": 0, "maximum": 3 }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["per_run_tokens", "per_run_usd", "per_tenant_daily_usd"],
+      "properties": {
+        "per_run_tokens": { "$ref": "#/$defs/positiveInt" },
+        "per_run_usd": { "type": "number", "exclusiveMinimum": 0 },
+        "per_tenant_daily_usd": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["wip_per_reviewer", "required_approvers"],
+      "properties": {
+        "wip_per_reviewer": { "$ref": "#/$defs/positiveInt" },
+        "required_approvers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["low", "high", "protected"],
+          "properties": {
+            "low": { "$ref": "#/$defs/positiveInt" },
+            "high": { "$ref": "#/$defs/positiveInt" },
+            "protected": { "type": "integer", "minimum": 2 }
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protected_paths", "diff_budget", "lease_ttl_seconds"],
+      "properties": {
+        "protected_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "diff_budget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["files", "lines"],
+          "properties": {
+            "files": { "$ref": "#/$defs/positiveInt" },
+            "lines": { "$ref": "#/$defs/positiveInt" }
+          }
+        },
+        "lease_ttl_seconds": { "$ref": "#/$defs/positiveInt" }
+      }
+    },
+    "sandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image", "cpus", "memory_mb", "pids", "timeout_seconds", "warm_pool_size", "network"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "cpus": { "type": "number", "exclusiveMinimum": 0 },
+        "memory_mb": { "type": "integer", "minimum": 128 },
+        "pids": { "type": "integer", "minimum": 16 },
+        "timeout_seconds": { "$ref": "#/$defs/positiveInt" },
+        "warm_pool_size": { "type": "integer", "minimum": 0 },
+        "network": { "const": "none", "description": "Sandboxes never get network access." }
+      }
+    },
+    "tenants": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "concurrency", "queue_priority", "daily_usd"],
+        "properties": {
+          "id": { "$ref": "#/$defs/name" },
+          "concurrency": { "$ref": "#/$defs/positiveInt" },
+          "queue_priority": { "enum": ["low", "normal", "high"] },
+          "daily_usd": { "type": "number", "exclusiveMinimum": 0 }
+        }
+      }
+    },
+    "tokens": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_ttl_seconds"],
+      "properties": { "capability_ttl_seconds": { "type": "integer", "minimum": 60, "maximum": 86400 } }
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expiry_seconds"],
+      "properties": { "expiry_seconds": { "$ref": "#/$defs/positiveInt" } }
+    },
+    "api": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["listen"],
+      "properties": { "listen": { "type": "string", "pattern": "^[^\\s]+:[0-9]{1,5}$" } }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "rules_ref"],
+      "properties": {
+        "enabled": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["scope", "lint", "tests", "hidden_tests", "semgrep", "bandit", "secrets", "dependencies", "openapi", "replay"] }
+        },
+        "rules_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "slo": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "concurrent_runs": { "$ref": "#/$defs/positiveInt" } }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "bundle_ref": { "type": "string" } }
+    }
+  }
+}

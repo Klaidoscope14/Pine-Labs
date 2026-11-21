@@ -1,0 +1,10 @@
+# Egress allow-list. Default: deny everything.
+# Phase 0: clients have no mTLS identity yet, so smokescreen denies every request ("role cannot be determined").
+# Phase 2: worker gets an mTLS client cert (role = aegis-worker) and allowed LLM hosts are generated from config.
+version: v1
+services: []
+default:
+  name: default
+  project: aegis
+  action: enforce
+  allowed_domains: []

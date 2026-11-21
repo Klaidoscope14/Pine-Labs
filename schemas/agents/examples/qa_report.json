@@ -1,0 +1,23 @@
+{
+  "tier": 1,
+  "commit_sha": "a1b2c3d4e5f6",
+  "passed": true,
+  "tests": {
+    "selected": 6,
+    "ran": 6,
+    "failed": []
+  },
+  "lint": {
+    "passed": true,
+    "issues": 0
+  },
+  "ac_traceability": [
+    {
+      "ac_id": "AC-1",
+      "evidence": [
+        "tests/test_webhooks.py::test_duplicate_event_credits_once"
+      ],
+      "status": "COVERED"
+    }
+  ]
+}

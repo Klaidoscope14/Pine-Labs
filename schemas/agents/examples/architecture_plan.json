@@ -1,0 +1,31 @@
+{
+  "impacted_modules": [
+    "webhooks",
+    "ledger"
+  ],
+  "design_summary": "Add a processed_events table with a unique event_id and make crediting idempotent inside one transaction.",
+  "interface_changes": [],
+  "scope": {
+    "planned": [
+      "app/webhooks/handler.py",
+      "app/ledger/store.py"
+    ],
+    "adjacent": [
+      "tests/test_webhooks.py"
+    ],
+    "protected_touched": []
+  },
+  "planned_tests": [
+    "tests/test_webhooks.py::test_duplicate_event_credits_once"
+  ],
+  "diff_budget": {
+    "files": 4,
+    "lines": 200
+  },
+  "decision_log": [
+    {
+      "decision": "Unique constraint over in-memory set",
+      "reason": "Survives restarts and concurrent workers"
+    }
+  ]
+}

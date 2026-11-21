@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aegis://schemas/agents/qa_report.schema.json",
+  "title": "qa_report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "tier",
+    "commit_sha",
+    "passed",
+    "tests",
+    "lint",
+    "ac_traceability"
+  ],
+  "properties": {
+    "tier": {
+      "enum": [
+        1,
+        2
+      ]
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,64}$"
+    },
+    "passed": {
+      "type": "boolean"
+    },
+    "tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "selected",
+        "ran",
+        "failed"
+      ],
+      "properties": {
+        "selected": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ran": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "hidden_tests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ran",
+        "failed"
+      ],
+      "properties": {
+        "ran": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "lint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "issues"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "issues": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "openapi_diff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "breaking",
+        "changes"
+      ],
+      "properties": {
+        "breaking": {
+          "type": "boolean"
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "passed",
+        "invariants"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "invariants": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "held"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1
+              },
+              "held": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      }
+    },
+    "ac_traceability": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "ac_id",
+          "evidence",
+          "status"
+        ],
+        "properties": {
+          "ac_id": {
+            "type": "string",
+            "pattern": "^AC-[0-9]+$"
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 0,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "status": {
+            "enum": [
+              "COVERED",
+              "UNCOVERED",
+              "FAILED"
+            ]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "pr_title": "Make settlement webhook crediting idempotent",
+  "summary": "Duplicate webhook deliveries no longer double-credit merchants.",
+  "base_sha": "0f1e2d3c4b5a",
+  "head_sha": "a1b2c3d4e5f6",
+  "evidence_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "risks": [
+    "New table requires migration"
+  ],
+  "rollout": {
+    "flag": "idempotent_webhooks",
+    "canary": "Enable for one tenant first",
+    "rollback": "Disable flag; table is additive"
+  },
+  "scorecard": {
+    "must_passed": 2,
+    "must_total": 2,
+    "should_passed": 1,
+    "should_total": 1
+  },
+  "cost_usd": 0.42,
+  "latency_ms": 184000,
+  "approval": "PENDING_HUMAN"
+}

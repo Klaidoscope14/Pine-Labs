@@ -1,0 +1,8 @@
+.data/
+deploy/compose/.env.secrets
+deploy/compose/.s3.json
+**/__pycache__/
+**/.venv/
+*.pyc
+.coverage
+/bin/
