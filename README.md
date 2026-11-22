@@ -62,59 +62,6 @@ reliable, without loosening a single check.
 
 ---
 
-## Demo script (about 6 minutes)
-
-A simple walkthrough you can follow live. Open the [live link](#) and enter the access code.
-
-**1. Set the scene (30 seconds)**
-> "Payment companies want AI to help with engineering, but they can't let it ship code
-> nobody checked. Aegis is the control room for that. Let me show you a real bug."
-
-**2. Submit a ticket as the requester (1 minute)**
-- Sign in as **Priya Sharma** (requester).
-- Press **C** (or click *New run*) and paste:
-  *"The acquiring bank retries settlement webhooks, and duplicate deliveries double-credit
-  merchant balances. Make the settlement webhook idempotent."*
-- Click **Start run**.
-> "That's all the requester does. Now watch the agents work."
-
-**3. Watch it build (1–2 minutes)**
-- The five-step bar moves: **Analyse → Plan → Build → Checks → Review**. No refresh needed.
-- Open the **Checks** tab once it gets there.
-> "Eleven checks, including hidden tests the AI never saw, and fintech rules like
-> 'never use floats for money'. If any fail, the agent gets the exact error and one more try."
-
-**4. Try to approve your own change (30 seconds)**
-- Still as Priya, look at the review bar: there's no Approve button.
-> "It says *'You submitted this run. Another reviewer must approve it.'* That's
-> maker-checker, required by PCI DSS — and it's enforced by the system, not by trust."
-
-**5. Review it like a human would (1 minute)**
-- Sign out and sign in as **Arjun Mehta** (reviewer). The **Review** count shows 1.
-- Open the run. Show the **Overview** (summary and risks), then **Changes** (the diff).
-- Click **Approve**. It shows **1 of 2 approvals**.
-> "It touches payment code, so it's high risk: it needs a second reviewer."
-
-**6. Second approval and merge (1 minute)**
-- Sign in as **Kavya Iyer** and approve.
-- The status turns **Approved**, then **Merged**. Open **Activity**.
-> "Every step, every approval, every check is in a tamper-evident audit log. The change
-> was re-tested against the latest main before it went in."
-
-**7. The big red button (30 seconds)**
-- Sign in as **Rohan Das** (operator) → **Settings** → *Stop everything* with a reason.
-- A banner appears; new runs and all AI calls are refused. Turn it off again.
-> "If anything ever looks wrong, one click stops every agent instantly."
-
-**8. Close (30 seconds)**
-> "AI does the typing. The checks do the proving. People make the decisions. And the
-> cheap open model passes the same bar as the premium one, at a twentieth of the cost."
-
-**Backup plan:** if the live link is slow, run it locally (below) — it uses recorded AI
-responses, so it works offline and costs nothing.
-
----
-
 ## Run it locally
 
 You need Go 1.26+, Docker, Make and Node 20+.
