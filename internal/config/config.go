@@ -149,6 +149,8 @@ type Workflow struct {
 	MaxCIRounds          int `json:"max_ci_rounds"`
 	MaxSchemaRepairs     int `json:"max_schema_repairs"`
 	MaxArbitrationRounds int `json:"max_arbitration_rounds"`
+	// MergeQueue lands approved runs through a per-repo merge queue (Phase 5).
+	MergeQueue bool `json:"merge_queue,omitempty"`
 }
 
 type Budget struct {
@@ -209,6 +211,10 @@ type Tokens struct {
 type Approval struct {
 	ExpirySeconds int            `json:"expiry_seconds"`
 	FreezeWindows []FreezeWindow `json:"freeze_windows,omitempty"`
+	// PolicyDir holds the Rego approval policy (PLAN.md §10.8); empty = built-in Go rules.
+	PolicyDir string `json:"policy_dir,omitempty"`
+	// RequirePasskey makes the policy refuse approvals not signed with a passkey.
+	RequirePasskey bool `json:"require_passkey,omitempty"`
 }
 
 // FreezeWindow is a change freeze: approvals are refused between Start and End.
@@ -219,7 +225,24 @@ type FreezeWindow struct {
 }
 
 type API struct {
-	Listen string `json:"listen"`
+	Listen        string `json:"listen"`
+	SessionKeyRef string `json:"session_key_ref,omitempty"`
+	// BFFTokenRef: the Next.js frontend's service token. OriginSecretRef: the header
+	// CloudFront adds, required on every off-host request when set.
+	BFFTokenRef     string `json:"bff_token_ref,omitempty"`
+	OriginSecretRef string `json:"origin_secret_ref,omitempty"`
+	// WebAuthnRPID and WebAuthnOrigins configure passkeys (default: localhost on api.listen's port).
+	WebAuthnRPID    string    `json:"webauthn_rp_id,omitempty"`
+	WebAuthnOrigins []string  `json:"webauthn_origins,omitempty"`
+	Users           []APIUser `json:"users,omitempty"`
+}
+
+// APIUser is a demo identity for the web app.
+type APIUser struct {
+	ID     string   `json:"id"`
+	Name   string   `json:"name"`
+	Tenant string   `json:"tenant"`
+	Roles  []string `json:"roles"`
 }
 
 type Gates struct {

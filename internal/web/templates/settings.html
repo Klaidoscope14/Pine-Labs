@@ -1,0 +1,27 @@
+{{define "page"}}
+<header class="top"><h1>Settings</h1></header>
+<section class="pane narrow">
+  <h3>Kill switch</h3>
+  {{if .Operator}}
+    {{if .Killed}}
+    <p class="muted">On for {{.User.Tenant}}. New runs and all model calls are refused.</p>
+    <form method="post" action="/settings/unkill"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="btn">Turn off</button></form>
+    {{else}}
+    <p class="muted">Stops every run in {{.User.Tenant}} and refuses new ones.</p>
+    <form method="post" action="/settings/kill" class="crow" data-confirm="Stop every run in {{.User.Tenant}}?">
+      <input type="hidden" name="csrf" value="{{.CSRF}}">
+      <input name="reason" required placeholder="Reason" class="grow">
+      <button class="btn danger">Stop everything</button>
+    </form>
+    {{end}}
+  {{else}}<p class="muted">Operators only.</p>{{end}}
+
+  <h3>Passkey</h3>
+  <p class="muted">{{if .Passkeys}}{{.Passkeys}} registered. Approvals are signed with it.{{else}}Sign approvals with a passkey (Touch ID, Windows Hello or a security key).{{end}}</p>
+  <button type="button" class="btn" data-passkey-register data-csrf="{{.CSRF}}">{{if .Passkeys}}Add another{{else}}Add passkey{{end}}</button>
+  <p class="muted small" id="pk-msg"></p>
+
+  <h3>Switch user</h3>
+  <form method="post" action="/logout"><input type="hidden" name="csrf" value="{{.CSRF}}"><button class="btn">Sign out</button></form>
+</section>
+{{end}}

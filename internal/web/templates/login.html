@@ -1,0 +1,17 @@
+{{define "page"}}
+<div class="center">
+  <div class="card login">
+    <div class="brand big"><span class="logo"></span>Aegis</div>
+    <p class="muted">Choose who you are</p>
+    <form method="post" action="/login" class="people">
+      {{range .People}}
+      <button name="user" value="{{.ID}}" class="person">
+        <span class="avatar">{{.Initials}}</span>
+        <span class="who"><b>{{.Name}}</b><small>{{.Role}} · {{.Tenant}}</small></span>
+      </button>
+      {{end}}
+    </form>
+    <p class="hint">Demo sign-in. Passkeys come in Phase 5.</p>
+  </div>
+</div>
+{{end}}

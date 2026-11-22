@@ -272,3 +272,37 @@ func TestRebaseConflictEscalates(t *testing.T) {
 		t.Fatalf("outcome %+v", out)
 	}
 }
+
+func TestApprovalPolicyDecides(t *testing.T) {
+	h := newHarness(t, "Release", "RecordDecision")
+	h.develop(DevelopResult{CommitSHA: "c1"})
+	h.evaluate(nil)
+	release(h, "high")
+	var d decisions
+	d.mock(h)
+	var seen []string
+	h.env.OnActivity(h.a.DecidePolicy, mock.Anything, mock.Anything).Return(func(_ context.Context, in PolicyInput) (PolicyResult, error) {
+		seen = append(seen, in.Decision.Reviewer)
+		switch {
+		case !in.Decision.Passkey:
+			return PolicyResult{Reason: "a passkey-signed approval is required", Needed: 2}, nil
+		case len(in.Approvals) == 0:
+			return PolicyResult{Accept: true, Needed: 2}, nil
+		default:
+			return PolicyResult{Accept: true, Satisfied: true, Needed: 2}, nil
+		}
+	})
+	h.env.RegisterDelayedCallback(func() { h.env.SignalWorkflow(SignalDecision, Decision{Approve: true, Reviewer: "alice"}) }, time.Minute)
+	h.env.RegisterDelayedCallback(func() {
+		h.env.SignalWorkflow(SignalDecision, Decision{Approve: true, Reviewer: "alice", Passkey: true})
+	}, 2*time.Minute)
+	h.env.RegisterDelayedCallback(func() {
+		h.env.SignalWorkflow(SignalDecision, Decision{Approve: true, Reviewer: "carol", Passkey: true})
+	}, 3*time.Minute)
+	in := p3Input()
+	in.Settings.UsePolicy = true
+	out := h.runWith(t, in)
+	if out.Status != Approved || len(seen) != 3 || !strings.Contains(d.list[0].Refused, "passkey") {
+		t.Fatalf("outcome %+v seen %v decisions %+v", out, seen, d.list)
+	}
+}

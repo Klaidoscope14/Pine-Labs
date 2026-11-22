@@ -15,6 +15,7 @@ import (
 
 	"aegis/internal/app"
 	"aegis/internal/config"
+	approval "aegis/internal/policy"
 	"aegis/internal/sandbox"
 	"aegis/internal/workflow"
 )
@@ -66,7 +67,16 @@ func main() {
 		log.Error("agents", "error", err.Error())
 		os.Exit(1)
 	}
+	var pol *approval.Engine
+	if cfg.Approval.PolicyDir != "" {
+		if pol, err = approval.Load(ctx, cfg.Path(cfg.Approval.PolicyDir)); err != nil {
+			log.Error("approval policy", "error", err.Error())
+			os.Exit(1)
+		}
+		log.Info("approval policy loaded", "dir", cfg.Approval.PolicyDir, "hash", pol.Hash, "require_passkey", cfg.Approval.RequirePasskey)
+	}
 	acts := &workflow.Activities{
+		Policy: pol, Temporal: c,
 		Cfg: cfg, Store: store, WS: app.Workspace(cfg), Image: cfg.Sandbox.Image,
 		Sandbox: docker,
 		Agents:  ag,
@@ -75,6 +85,7 @@ func main() {
 		MaxConcurrentActivityExecutionSize: cfg.Temporal.MaxConcurrentActivities,
 	})
 	w.RegisterWorkflowWithOptions(workflow.Run, tworkflow.RegisterOptions{Name: app.WorkflowName})
+	w.RegisterWorkflowWithOptions(workflow.MergeQueue, tworkflow.RegisterOptions{Name: app.MergeQueueName})
 	w.RegisterActivity(acts)
 	log.Info("worker started", "task_queue", app.TaskQueue(cfg), "config_hash", cfg.Hash,
 		"agents", cfg.Agents.Mode, "providers", cfg.LLM.FallbackOrder)

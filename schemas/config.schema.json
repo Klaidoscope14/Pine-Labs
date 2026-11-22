@@ -401,6 +401,10 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 3
+        },
+        "merge_queue": {
+          "type": "boolean",
+          "description": "Land approved runs through a per-repo merge queue (rebase on tip, re-test, fast-forward)."
         }
       }
     },
@@ -634,6 +638,15 @@
         "expiry_seconds": {
           "$ref": "#/$defs/positiveInt"
         },
+        "policy_dir": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Directory with the Rego approval policy (package aegis.approval)."
+        },
+        "require_passkey": {
+          "type": "boolean",
+          "description": "Refuse approvals that are not signed with a registered passkey."
+        },
         "freeze_windows": {
           "type": "array",
           "description": "Change freezes (e.g. month-end settlement): approvals are refused inside a window.",
@@ -660,6 +673,46 @@
         "listen": {
           "type": "string",
           "pattern": "^[^\\s]+:[0-9]{1,5}$"
+        },
+        "session_key_ref": {
+          "$ref": "#/$defs/secretRef",
+          "description": "HMAC key for the web session cookie."
+        },
+        "bff_token_ref": {
+          "$ref": "#/$defs/secretRef",
+          "description": "Shared secret the Next.js server (Vercel) sends as a bearer token."
+        },
+        "origin_secret_ref": {
+          "$ref": "#/$defs/secretRef",
+          "description": "When set, off-host requests must carry it in X-Origin-Verify (only CloudFront adds it)."
+        },
+        "webauthn_rp_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "WebAuthn relying-party ID (the site's domain; 'localhost' through the SSM tunnel)."
+        },
+        "webauthn_origins": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^https?://" },
+          "description": "Origins allowed to use passkeys."
+        },
+        "users": {
+          "type": "array",
+          "description": "Demo identities for the web app (Phase 5 replaces this with passkeys).",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name", "tenant", "roles"],
+            "properties": {
+              "id": { "type": "string", "pattern": "^[a-z0-9._-]+$" },
+              "name": { "type": "string", "minLength": 1 },
+              "tenant": { "type": "string", "minLength": 1 },
+              "roles": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": { "enum": ["requester", "reviewer", "operator"] }
+              }
+            }
+          }
         }
       }
     },

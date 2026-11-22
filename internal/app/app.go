@@ -95,6 +95,8 @@ func Settings(cfg *config.Config, tenant string) workflow.Settings {
 		ReviewPoll:           orDefault(cfg.Review.ReviewPollSeconds, 30),
 		PauseRetry:           orDefault(cfg.LLM.PauseRetrySeconds, 300),
 		MaxRebases:           3,
+		UsePolicy:            cfg.Approval.PolicyDir != "",
+		MergeQueue:           cfg.Workflow.MergeQueue,
 	}
 }
 
@@ -119,6 +121,9 @@ func TaskQueue(cfg *config.Config) string {
 
 // WorkflowName is the registered name of the blueprint workflow.
 const WorkflowName = "AegisRun"
+
+// MergeQueueName is the registered name of the per-repo merge queue workflow.
+const MergeQueueName = workflow.MergeQueueName
 
 // Agents builds the configured agent implementation (stub or Claude-backed).
 func Agents(ctx context.Context, cfg *config.Config, store *ledger.Store, sb sandbox.Provider) (agents.Agents, error) {

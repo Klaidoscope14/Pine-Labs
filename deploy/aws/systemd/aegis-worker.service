@@ -1,0 +1,19 @@
+[Unit]
+Description=AegisSDLC worker (Temporal activities, agents, gates)
+After=docker.service network-online.target
+Requires=docker.service
+
+[Service]
+User=ec2-user
+WorkingDirectory=/opt/aegis/src
+EnvironmentFile=/opt/aegis/src/deploy/compose/.env.secrets
+Environment=GOMEMLIMIT=3GiB
+ExecStart=/opt/aegis/src/bin/aegis-worker -config config.aws.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target

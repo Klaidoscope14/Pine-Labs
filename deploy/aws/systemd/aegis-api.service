@@ -1,0 +1,18 @@
+[Unit]
+Description=AegisSDLC web app and API (loopback only; reach it through the SSM tunnel)
+After=docker.service network-online.target aegis-worker.service
+
+[Service]
+User=ec2-user
+WorkingDirectory=/opt/aegis/src
+EnvironmentFile=/opt/aegis/src/deploy/compose/.env.secrets
+Environment=GOMEMLIMIT=512MiB
+ExecStart=/opt/aegis/src/bin/aegis-api -config config.aws.yaml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=full
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

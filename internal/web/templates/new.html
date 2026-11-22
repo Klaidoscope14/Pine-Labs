@@ -1,0 +1,16 @@
+{{define "page"}}
+<div class="center top-pad">
+  <form method="post" action="/runs" class="card compose">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <h1>New run</h1>
+    <textarea name="requirement" rows="7" required maxlength="8000" placeholder="Describe the change, like a ticket…" autofocus></textarea>
+    <div class="crow">
+      <select name="repo">{{range .Repos}}<option>{{.}}</option>{{end}}</select>
+      {{if .Scenario}}<input name="scenario" class="ghost" placeholder="scenario (testing)">{{end}}
+      <span class="grow"></span>
+      <a href="/runs" class="btn">Cancel</a>
+      <button class="btn primary">Start run <kbd>⌘↵</kbd></button>
+    </div>
+  </form>
+</div>
+{{end}}

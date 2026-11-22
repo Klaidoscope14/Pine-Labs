@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "aegis-web",
+      "runtimeExecutable": "bash",
+      "runtimeArgs": ["-c", "set -a; . deploy/compose/.env.secrets; set +a; exec bin/aegis-api -config config.replay.yaml"],
+      "port": 8480
+    }
+  ]
+}

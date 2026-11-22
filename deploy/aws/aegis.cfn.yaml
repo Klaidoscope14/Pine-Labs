@@ -21,11 +21,27 @@ Parameters:
   VpcCidr:
     Type: String
     Default: 10.42.0.0/24
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ""
+    Description: >
+      Managed prefix list com.amazonaws.global.cloudfront.origin-facing for this region.
+      Empty = no public endpoint (SSM tunnel only). scripts/aws.sh public fills it in.
+  OriginSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Header value only CloudFront adds (X-Origin-Verify); the API refuses off-host requests without it.
   SecretsPrefix:
     Type: String
     Default: /aegis
     AllowedPattern: "^/[A-Za-z0-9_/-]+$"
     Description: SSM Parameter Store prefix holding the model API key (SecureString).
+
+Conditions:
+  PublicApi: !And
+    - !Not [!Equals [!Ref CloudFrontPrefixListId, ""]]
+    - !Not [!Equals [!Ref OriginSecret, ""]]
 
 Resources:
   # ---------- network: one public subnet for outbound HTTPS; no inbound rules ----------
@@ -93,7 +109,7 @@ Resources:
             Principal: "*"
             Action: s3:*
             Resource: [!GetAtt BundleBucket.Arn, !Sub "${BundleBucket.Arn}/*"]
-            Condition: { Bool: { aws:SecureTransport: "false" } }
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
 
   # ---------- least-privilege instance role (no access keys on the machine) ----------
   InstanceRole:
@@ -104,7 +120,7 @@ Resources:
           - Effect: Allow
             Principal: { Service: ec2.amazonaws.com }
             Action: sts:AssumeRole
-            Condition: { StringEquals: { aws:SourceAccount: !Ref AWS::AccountId } }
+            Condition: { StringEquals: { "aws:SourceAccount": !Ref "AWS::AccountId" } }
       ManagedPolicyArns:
         - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
       Policies:
@@ -193,6 +209,53 @@ Resources:
           install -d -o ec2-user -g ec2-user -m 750 /opt/aegis
           touch /opt/aegis/.provisioned
 
+  # ---------- optional public API for the Vercel frontend: CloudFront only ----------
+  ApiAddress:
+    Type: AWS::EC2::EIP
+    Condition: PublicApi
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref Instance
+      Tags: [{ Key: Name, Value: aegis-api }]
+  ApiFromCloudFront:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: PublicApi
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 8480
+      ToPort: 8480
+      SourcePrefixListId: !Ref CloudFrontPrefixListId
+      Description: Aegis API, reachable only from CloudFront origin-facing addresses
+  ApiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: PublicApi
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Aegis API for the Vercel frontend (no caching)
+        PriceClass: PriceClass_200
+        HttpVersion: http2and3
+        Origins:
+          - Id: aegis-api
+            # Public DNS of the Elastic IP (stable across instance stop/start).
+            DomainName: !Join ["", ["ec2-", !Join ["-", !Split [".", !Ref ApiAddress]], ".", !Ref "AWS::Region", ".compute.amazonaws.com"]]
+            CustomOriginConfig:
+              HTTPPort: 8480
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Verify
+                HeaderValue: !Ref OriginSecret
+        DefaultCacheBehavior:
+          TargetOriginId: aegis-api
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad          # Managed-CachingDisabled
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+
 Outputs:
   InstanceId:
     Value: !Ref Instance
@@ -200,3 +263,7 @@ Outputs:
     Value: !Ref BundleBucket
   Region:
     Value: !Ref AWS::Region
+  ApiUrl:
+    Condition: PublicApi
+    Description: Set this as AEGIS_API_URL in Vercel
+    Value: !Sub "https://${ApiDistribution.DomainName}"

@@ -13,7 +13,7 @@ if [[ ! -f "$dir/.env.secrets" ]]; then
   echo "created $dir/.env.secrets"
 fi
 # Add any key introduced after the file was first created, without touching existing values.
-for key in AEGIS_APP_DB_PASSWORD; do
+for key in AEGIS_APP_DB_PASSWORD AEGIS_SESSION_KEY AEGIS_BFF_TOKEN AEGIS_ORIGIN_SECRET; do
   if ! grep -q "^$key=" "$dir/.env.secrets"; then
     echo "$key=$(openssl rand -hex 24)" >> "$dir/.env.secrets"
     echo "added $key to $dir/.env.secrets"

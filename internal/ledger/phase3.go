@@ -165,3 +165,14 @@ func (s *Store) ReconcileRun(ctx context.Context, tenant, runID, status, reason 
 		return appendAudit(ctx, tx, tenant, runID, "run.reconciled", map[string]any{"from": old, "to": status, "reason": reason})
 	})
 }
+
+// RecordMerge sets a run's merge outcome (MERGED or MERGE_FAILED) with an audit event.
+func (s *Store) RecordMerge(ctx context.Context, tenant, runID, status, mergedSHA, reason string) error {
+	return s.tx(ctx, tenant, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE runs SET status = $2,
+			head_sha = CASE WHEN $3 <> '' THEN $3 ELSE head_sha END, updated_at = now() WHERE run_id = $1`, runID, status, mergedSHA); err != nil {
+			return err
+		}
+		return appendAudit(ctx, tx, tenant, runID, "run.merge", map[string]any{"status": status, "merged_sha": mergedSHA, "reason": reason})
+	})
+}

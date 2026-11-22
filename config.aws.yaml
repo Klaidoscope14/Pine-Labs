@@ -20,3 +20,9 @@ llm:
     # Adaptive effort (PLAN.md §10.5 L10): planning turns and turns after a failure stay
     # at `high`; routine reads and edits use `low`. Kept only if the benchmark holds.
     developer: { effort: high, routine_effort: low, max_tokens: 16000 }
+# The Vercel frontend reaches the API through CloudFront only: the security group
+# admits CloudFront's origin-facing addresses on 8480, and the API refuses any
+# off-host request without CloudFront's secret header. Loopback (SSM tunnel) still works.
+api:
+  listen: "0.0.0.0:8480"
+  origin_secret_ref: env:AEGIS_ORIGIN_SECRET

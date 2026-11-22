@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.PageTitle}} · Aegis</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1l6 2.5v4.2C14 11.5 11.4 14.3 8 15c-3.4-.7-6-3.5-6-7.3V3.5z' fill='%235e6ad2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{{if .User.ID}}
+<div class="shell">
+  <aside class="side">
+    <a class="brand" href="/runs"><span class="logo"></span>Aegis</a>
+    <a class="newbtn" href="/new" data-key="c"><span>New run</span><kbd>C</kbd></a>
+    <nav>
+      <a href="/runs" class="{{if eq .Nav "runs"}}on{{end}}"><i class="ic ic-runs"></i>Runs</a>
+      <a href="/runs?view=review" class="{{if eq .Nav "review"}}on{{end}}"><i class="ic ic-review"></i>Review{{if .ReviewCount}}<span class="count">{{.ReviewCount}}</span>{{end}}</a>
+      <a href="/settings" class="{{if eq .Nav "settings"}}on{{end}}"><i class="ic ic-settings"></i>Settings</a>
+    </nav>
+    <div class="me">
+      <span class="avatar">{{.User.Initials}}</span>
+      <span class="who"><b>{{.User.Name}}</b><small>{{.User.Tenant}}</small></span>
+    </div>
+  </aside>
+  <main>
+    {{if .Killed}}<div class="banner">Kill switch on — {{.Killed}}</div>{{end}}
+    {{template "page" .}}
+  </main>
+</div>
+<div class="palette" id="palette" hidden>
+  <div class="pbox">
+    <input id="pq" placeholder="Type a command or search…" autocomplete="off">
+    <ul id="pl"></ul>
+  </div>
+</div>
+{{else}}
+{{template "page" .}}
+{{end}}
+</body>
+</html>

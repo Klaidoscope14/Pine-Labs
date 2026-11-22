@@ -58,7 +58,7 @@ printf "\r   %s after %ds%20s\n" "$status" $(( $(date +%s) - start )) ""
 strip() { sed -E 's/\x1b\[[0-9;]*m//g'; }
 stdout="$(aws_ ssm get-command-invocation --command-id "$cmd_id" --instance-id "$instance" --query StandardOutputContent --output text | strip)"
 if [[ "$status" == Success ]]; then
-  echo "$stdout" | grep -E '^(  OK|  FAIL|ledger migrated|seeded |code host repo|== |[0-9.]+-gvisor|deploy complete)' | sed 's/^/   /'
+  echo "$stdout" | grep -E '^(  OK|  FAIL|ledger migrated|seeded |code host repo|== |[0-9.]+-gvisor|  aegis-|  web app|deploy complete)' | sed 's/^/   /'
   echo
   echo "deployed to $instance ($AWS_REGION). Full log: scripts/aws.sh logs"
 else

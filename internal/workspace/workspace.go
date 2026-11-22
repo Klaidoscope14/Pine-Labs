@@ -253,6 +253,38 @@ func (m Manager) Rebase(ctx context.Context, wt Worktree, newBase string) (head 
 	return head, false, err
 }
 
+// MergeWorktree checks out an existing run branch in a fresh worktree for the
+// merge queue (the run's own worktree is gone by then; its branch is kept).
+func (m Manager) MergeWorktree(ctx context.Context, mirror, runID, branch, baseSHA string) (Worktree, error) {
+	if !safeID.MatchString(runID) || !shaLike.MatchString(baseSHA) {
+		return Worktree{}, fmt.Errorf("invalid run id or base sha")
+	}
+	wt := Worktree{RunID: runID, Mirror: mirror, Path: filepath.Join(m.RunsDir, "merge-"+runID), Branch: branch, BaseSHA: baseSHA}
+	unlock, err := lock(mirror)
+	if err != nil {
+		return Worktree{}, err
+	}
+	defer unlock()
+	_, _ = m.git(ctx, mirror, "worktree", "remove", "--force", "--", wt.Path) // a crashed earlier attempt
+	_, _ = m.git(ctx, mirror, "worktree", "prune")
+	if _, err := m.git(ctx, mirror, "worktree", "add", "--force", "--", wt.Path, branch); err != nil {
+		return Worktree{}, err
+	}
+	return wt, nil
+}
+
+// PushMain fast-forwards the remote's main to the worktree's HEAD. A non
+// fast-forward (main moved again) is refused by git and reported as moved=true.
+func (m Manager) PushMain(ctx context.Context, wt Worktree, remote, branch string) (moved bool, err error) {
+	if _, err := m.git(ctx, wt.Path, "push", "--porcelain", remote, "HEAD:refs/heads/"+branch); err != nil {
+		if strings.Contains(err.Error(), "non-fast-forward") || strings.Contains(err.Error(), "rejected") || strings.Contains(err.Error(), "fetch first") {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
 // TreeOf returns the tree hash of a commit (identical content gives an identical hash).
 func (m Manager) TreeOf(ctx context.Context, wt Worktree, commit string) (string, error) {
 	out, err := m.git(ctx, wt.Path, "rev-parse", commit+"^{tree}")

@@ -11,6 +11,11 @@
 #   result    show the live-check summary from the instance
 #   logs      tail the instance's setup and live-check logs
 #   shell     open a shell on the instance (Session Manager)
+#   web       open the Aegis web app: tunnels the instance's 127.0.0.1:8480 to http://localhost:8480
+#   public    give the API a public HTTPS address via CloudFront (for the Vercel frontend); prints AEGIS_API_URL
+#   frontend  tell the API where the frontend lives (passkeys bind to it): scripts/aws.sh frontend https://<app>.vercel.app
+#   vercel-env  print the values to paste into Vercel's environment variables (shows a secret on your screen)
+#   services  show the worker and web app services on the instance (restart with: services restart)
 #   tunnel    forward an instance UI to localhost: scripts/aws.sh tunnel 3000  (3000 Grafana, 8233 Temporal, 16686 Jaeger)
 #   start     start the instance
 #   stop      stop the instance (data stays on the disk; billing for compute stops)
@@ -119,6 +124,64 @@ case "$cmd" in
     aws ssm start-session --target "$(instance)"
     ;;
 
+  web)
+    echo "Aegis web app: http://localhost:8480  (Ctrl-C to close the tunnel)"
+    ( sleep 4; command -v open >/dev/null && open http://localhost:8480 ) &
+    aws ssm start-session --target "$(instance)" --document-name AWS-StartPortForwardingSession \
+      --parameters "portNumber=8480,localPortNumber=8480"
+    ;;
+
+  services)
+    if [[ "${2:-}" == restart ]]; then
+      run_remote "sudo systemctl restart aegis-worker aegis-api; sleep 2; systemctl --no-pager --lines=0 status aegis-worker aegis-api | grep -E 'Loaded|Active|aegis-'"
+    else
+      run_remote "systemctl --no-pager --lines=0 status aegis-worker aegis-api | grep -E '●|Active'; curl -fsS http://127.0.0.1:8480/healthz && echo"
+    fi
+    ;;
+
+  public)
+    account_guard >/dev/null
+    # Shared secrets: generated once, kept in SSM (SecureString), never printed here.
+    for name in bff-token origin-secret; do
+      if ! aws ssm get-parameter --name "/aegis/$name" --query Parameter.Name --output text >/dev/null 2>&1; then
+        openssl rand -hex 32 | tr -d '\n' | aws ssm put-parameter --name "/aegis/$name" --type SecureString --value file:///dev/stdin >/dev/null
+        echo "created /aegis/$name"
+      fi
+    done
+    pl="$(aws ec2 describe-managed-prefix-lists --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+      --query 'PrefixLists[0].PrefixListId' --output text)"
+    [[ "$pl" == pl-* ]] || die "CloudFront prefix list not found in $AWS_REGION"
+    origin="$(aws ssm get-parameter --name /aegis/origin-secret --with-decryption --query Parameter.Value --output text)"
+    echo "== updating stack $STACK (CloudFront + Elastic IP + firewall rule); if the instance template changed, it restarts once"
+    aws cloudformation deploy --stack-name "$STACK" --template-file "$root/deploy/aws/aegis.cfn.yaml" --capabilities CAPABILITY_IAM \
+      --parameter-overrides "CloudFrontPrefixListId=$pl" "OriginSecret=$origin" --no-fail-on-empty-changeset
+    unset origin
+    echo "== shipping code so the API picks up the shared secrets"
+    SKIP_STACK=1 "$root/scripts/aws-deploy.sh"
+    echo
+    echo "AEGIS_API_URL=$(out ApiUrl)"
+    echo "Next: scripts/aws.sh vercel-env   (values for Vercel)"
+    ;;
+
+  frontend)
+    origin="${2:-}"
+    [[ "$origin" =~ ^https://[a-zA-Z0-9.-]+$ ]] || die "usage: scripts/aws.sh frontend https://<app>.vercel.app"
+    aws ssm put-parameter --name /aegis/frontend-origin --type String --value "$origin" --overwrite >/dev/null
+    echo "passkeys will bind to $origin; restarting the API with it"
+    run_remote "cd /opt/aegis/src && v=\$(aws ssm get-parameter --region $AWS_REGION --name /aegis/frontend-origin --query Parameter.Value --output text) &&
+      grep -v '^AEGIS_WEBAUTHN_ORIGIN=' deploy/compose/.env.secrets > /tmp/s && echo \"AEGIS_WEBAUTHN_ORIGIN=\$v\" >> /tmp/s && install -m 600 /tmp/s deploy/compose/.env.secrets && rm -f /tmp/s &&
+      sudo systemctl restart aegis-api && sleep 2 && systemctl is-active aegis-api"
+    ;;
+
+  vercel-env)
+    url="$(out ApiUrl)"; [[ -n "$url" && "$url" != None ]] || die "no public API yet (scripts/aws.sh public)"
+    echo "# Paste into Vercel → Project → Settings → Environment Variables (Production)."
+    echo "AEGIS_API_URL=$url"
+    echo "AEGIS_BFF_TOKEN=$(aws ssm get-parameter --name /aegis/bff-token --with-decryption --query Parameter.Value --output text)"
+    echo "AEGIS_SESSION_SECRET=$(openssl rand -hex 32)"
+    echo "AEGIS_ACCESS_CODE=<choose a long access code and share it only with your reviewers>"
+    ;;
+
   tunnel)
     port="${2:-3000}"
     echo "forwarding localhost:$port -> instance:$port (Ctrl-C to stop)"
@@ -148,7 +211,7 @@ case "$cmd" in
     ;;
 
   help|-h|--help)
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
     ;;
 
   *)

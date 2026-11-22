@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 
 	"aegis/internal/agents"
@@ -26,6 +27,7 @@ import (
 	"aegis/internal/gates"
 	"aegis/internal/ledger"
 	"aegis/internal/llm"
+	"aegis/internal/policy"
 	"aegis/internal/sandbox"
 	"aegis/internal/workspace"
 )
@@ -38,6 +40,10 @@ type Activities struct {
 	Sandbox sandbox.Provider
 	Agents  agents.Agents
 	Image   string
+	// Policy is the compiled Rego approval policy (nil = built-in rules).
+	Policy *policy.Engine
+	// Temporal lets activities signal other workflows (the merge queue).
+	Temporal client.Client
 }
 
 // ---- activity payloads (kept small: hashes and summaries only) ----

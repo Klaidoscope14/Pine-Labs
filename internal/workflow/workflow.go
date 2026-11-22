@@ -76,6 +76,10 @@ type Settings struct {
 	ReviewPoll           time.Duration  `json:"review_poll"`
 	PauseRetry           time.Duration  `json:"pause_retry"`
 	MaxRebases           int            `json:"max_rebases"`
+	// UsePolicy routes each decision through the Rego approval policy (Phase 5).
+	UsePolicy bool `json:"use_policy,omitempty"`
+	// MergeQueue sends approved runs to the repo's merge queue (Phase 5).
+	MergeQueue bool `json:"merge_queue,omitempty"`
 }
 
 // FreezeWindow is a change freeze: approvals inside it are refused.
@@ -104,6 +108,10 @@ type Decision struct {
 	Approve  bool   `json:"approve"`
 	Reviewer string `json:"reviewer"`
 	Note     string `json:"note"`
+	// Passkey is true when the API verified a WebAuthn assertion bound to this
+	// change (run, base, head, evidence); Credential names the passkey used.
+	Passkey    bool   `json:"passkey,omitempty"`
+	Credential string `json:"credential,omitempty"`
 }
 
 // Outcome is the workflow result.
@@ -566,7 +574,32 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 				return finish(Expired, "no human decision before the approval expired")
 			}
 			refused := ""
-			if v3 {
+			policyDone := false
+			// Phase 5: the Rego approval policy decides (when configured).
+			if v3 && in.Settings.UsePolicy && workflow.GetVersion(ctx, "approval-policy", workflow.DefaultVersion, 1) == 1 {
+				names := make([]string, 0, len(approvers))
+				for r := range approvers {
+					names = append(names, r)
+				}
+				sort.Strings(names)
+				var pr PolicyResult
+				if err := workflow.ExecuteActivity(actx, a.DecidePolicy, PolicyInput{Run: in, Decision: decision, RiskTier: pkt.RiskTier,
+					Approvals: names, Now: workflow.Now(ctx)}).Get(actx, &pr); err != nil {
+					cancelTimer()
+					return out, err
+				}
+				if !pr.Accept {
+					refused = pr.Reason
+					if refused == "" {
+						refused = "refused by approval policy"
+					}
+				}
+				if pr.Needed > need {
+					need = pr.Needed
+				}
+				policyDone = true
+			}
+			if v3 && !policyDone {
 				switch {
 				case decision.Approve && in.Submitter != "" && decision.Reviewer == in.Submitter:
 					refused = "maker-checker: the submitter cannot approve their own change"
@@ -628,6 +661,14 @@ func Run(ctx workflow.Context, in Input) (Outcome, error) {
 			names = append(names, r)
 		}
 		sort.Strings(names)
-		return finish(Approved, "approved by "+strings.Join(names, ", "))
+		reason := "approved by " + strings.Join(names, ", ")
+		// Phase 5: land it through the repo's merge queue (rebase on tip, re-test, fast-forward).
+		if v3 && in.Settings.MergeQueue && workflow.GetVersion(ctx, "merge-queue", workflow.DefaultVersion, 1) == 1 {
+			if err := workflow.ExecuteActivity(actx, a.EnqueueMerge, MergeRequest{Run: in, Workspace: ws, HeadSHA: out.HeadSHA, Plan: plan.JSON}).Get(actx, nil); err != nil {
+				return out, err
+			}
+			reason += "; queued to merge"
+		}
+		return finish(Approved, reason)
 	}
 }

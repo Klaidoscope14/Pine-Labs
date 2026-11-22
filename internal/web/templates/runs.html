@@ -1,0 +1,33 @@
+{{define "page"}}
+<header class="top">
+  <h1>{{if eq .View "review"}}Review{{else}}Runs{{end}}</h1>
+  {{if ne .View "review"}}
+  <div class="tabs">
+    <a href="/runs" class="{{if eq .View "active"}}on{{end}}">Active</a>
+    <a href="/runs?view=review" class="{{if eq .View "review"}}on{{end}}">Review</a>
+    <a href="/runs?view=done" class="{{if eq .View "done"}}on{{end}}">Done</a>
+  </div>
+  {{end}}
+</header>
+{{if .Rows}}
+<ul class="list" data-live>
+  {{range .Rows}}
+  <li><a href="/runs/{{.ID}}" class="row">
+    <span class="dot {{.Tone}}"></span>
+    <span class="rid">{{short .ID}}</span>
+    <span class="rtitle">{{.Title}}</span>
+    {{if eq .Tier "high"}}<span class="tag">High risk</span>{{end}}
+    <span class="rstatus">{{.Status}}</span>
+    <span class="rcost">{{.Cost}}</span>
+    <span class="rage">{{.Age}}</span>
+  </a></li>
+  {{end}}
+</ul>
+{{else}}
+<div class="empty" data-live>
+  {{if eq .View "review"}}<p>Nothing to review.</p>
+  {{else if eq .View "done"}}<p>No finished runs yet.</p>
+  {{else}}<p>No active runs.</p><a class="btn primary" href="/new">New run</a>{{end}}
+</div>
+{{end}}
+{{end}}

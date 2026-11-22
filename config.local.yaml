@@ -101,7 +101,7 @@ llm:
     developer: { effort: high, max_tokens: 16000 }
     release:   { effort: low,  max_tokens: 8000 }
 
-workflow: { max_ci_rounds: 2, max_schema_repairs: 2, max_arbitration_rounds: 1 }
+workflow: { max_ci_rounds: 2, max_schema_repairs: 2, max_arbitration_rounds: 1, merge_queue: true }
 budget: { per_run_tokens: 2000000, per_run_usd: 5, per_tenant_daily_usd: 100 }
 review:
   wip_per_reviewer: 2
@@ -133,7 +133,24 @@ approval:
   expiry_seconds: 86400
   # Change freezes (approvals refused inside). Example: month-end settlement.
   freeze_windows: []
-api: { listen: "127.0.0.1:8480" }
+  policy_dir: policies          # Rego approval policy (OPA)
+  require_passkey: false        # true on AWS once reviewers have registered passkeys
+api:
+  listen: "127.0.0.1:8480"
+  session_key_ref: env:AEGIS_SESSION_KEY
+  bff_token_ref: env:AEGIS_BFF_TOKEN              # the Next.js server's service token
+  webauthn_rp_id: localhost                       # passkeys work on http://localhost (also through the SSM tunnel)
+  webauthn_origins: ["http://localhost:8480"]
+  # Demo identities (Phase 5: passkeys). Maker-checker: a requester can't approve their own run.
+  users:
+    - { id: priya,  name: Priya Sharma, tenant: payments-team,    roles: [requester] }
+    - { id: arjun,  name: Arjun Mehta,  tenant: payments-team,    roles: [reviewer] }
+    - { id: kavya,  name: Kavya Iyer,   tenant: payments-team,    roles: [reviewer] }
+    - { id: rohan,  name: Rohan Das,    tenant: payments-team,    roles: [operator] }
+    - { id: meera,  name: Meera Nair,   tenant: settlements-team, roles: [requester, reviewer] }
+    - { id: vikram, name: Vikram Rao,   tenant: settlements-team, roles: [reviewer] }
+    - { id: sana,   name: Sana Khan,    tenant: settlements-team, roles: [reviewer] }
+    - { id: ananya, name: Ananya Bose,  tenant: settlements-team, roles: [operator] }
 gates:
   enabled: [scope, integrity, lint, tests, hidden_tests, semgrep, bandit, secrets, dependencies, openapi, replay]
   tier1: [scope, integrity, lint, tests]

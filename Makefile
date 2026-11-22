@@ -118,6 +118,15 @@ phase2-offline: build ## Real agents on replayed responses; card number must nev
 phase2-live: build ## SPENDS MONEY: live runs (5x Demo 1, protected file, kill switch). LIVE_CONFIG=config.deepseek.yaml for DeepSeek, PARALLEL=1 to run them at once
 	@$(SECRETS_ENV) PARALLEL=$(PARALLEL) scripts/phase2-live.sh $(LOGS) $(or $(RUNS),5) $(or $(LIVE_CONFIG),config.bedrock.yaml)
 
+# ---------------- Phase 4: web app (PLAN.md §10.7) ----------------
+.PHONY: web benchmark
+
+benchmark: build ## SPENDS MONEY/QUOTA: same tickets on each model, report in evals/benchmark.md. RUNS=5
+	@$(SECRETS_ENV) scripts/benchmark.sh $(or $(RUNS),5) "Claude Sonnet 5.5=config.claude-code.yaml" "DeepSeek V4.1 Flash=config.deepseek.yaml"
+
+web: build ## Run the web app on api.listen (needs a worker for the same config): make web CONFIG=config.replay.yaml
+	$(SECRETS_ENV) bin/aegis-api -config $(CONFIG)
+
 # ---------------- AWS (PLAN.md §10.4) ----------------
 .PHONY: aws deploy deploy-tunnel
 

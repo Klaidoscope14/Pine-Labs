@@ -1,0 +1,88 @@
+{{define "page"}}
+<header class="top run">
+  <div class="crumbs"><a href="/runs">Runs</a><span>/</span><span class="rid">{{short .ID}}</span></div>
+  <h1>{{.Title}}</h1>
+  <div class="meta">
+    <span class="pill {{.Tone}}"><span class="dot {{.Tone}}"></span>{{.Status}}</span>
+    {{if eq .Tier "high"}}<span class="tag">High risk</span>{{end}}
+    <span class="muted">{{.Cost}} · {{.Age}} ago</span>
+  </div>
+</header>
+
+<ol class="strip" data-live>
+  {{range .Steps}}<li class="{{.State}}"><span></span>{{.Name}}</li>{{end}}
+</ol>
+
+{{if .InReview}}
+<section class="decide">
+  <div class="need">
+    <b>{{.Have}} of {{.Need}}</b> approval{{if gt .Need 1}}s{{end}}
+    {{range .Approvals}}{{if eq .Decision "APPROVE"}}<span class="chip">✓ {{.Reviewer}}</span>{{end}}{{end}}
+  </div>
+  {{if .CanDecide}}
+  <form method="post" action="/runs/{{.ID}}/decision" class="actions">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button class="btn" name="decision" value="reject">Reject</button>
+    {{if .HasPasskey}}
+    <button type="button" class="btn primary" data-passkey-approve="/api/runs/{{.ID}}" data-csrf="{{.CSRF}}">Approve with passkey</button>
+    {{else if .NeedPasskey}}
+    <a class="btn" href="/settings">Add a passkey to approve</a>
+    {{else}}
+    <button class="btn primary" name="decision" value="approve">Approve</button>
+    {{end}}
+  </form>
+  {{else}}<span class="muted">{{.Why}}</span>{{end}}
+</section>
+{{end}}
+
+<nav class="tabs under">
+  <a href="?tab=overview" class="{{if eq .Tab "overview"}}on{{end}}">Overview</a>
+  <a href="?tab=changes" class="{{if eq .Tab "changes"}}on{{end}}">Changes</a>
+  <a href="?tab=checks" class="{{if eq .Tab "checks"}}on{{end}}">Checks</a>
+  <a href="?tab=activity" class="{{if eq .Tab "activity"}}on{{end}}">Activity</a>
+</nav>
+
+{{if eq .Tab "overview"}}
+<section class="pane overview">
+  {{if .HasPacket}}<p class="summary">{{.Packet.Summary}}</p>
+  {{if .Packet.Risks}}<h3>Risks</h3><ul class="risks">{{range .Packet.Risks}}<li>{{.}}</li>{{end}}</ul>{{end}}
+  {{else}}<p class="muted">The summary appears when the change is ready for review.</p>{{end}}
+  <dl class="facts">
+    <div><dt>Requested by</dt><dd>{{if .Submitter}}{{.Submitter}}{{else}}—{{end}}</dd></div>
+    <div><dt>Files changed</dt><dd>{{.Files}}</dd></div>
+    <div><dt>Model calls</dt><dd>{{.Calls}}</dd></div>
+    <div><dt>Tokens</dt><dd>{{.Tokens}}</dd></div>
+  </dl>
+</section>
+{{else if eq .Tab "changes"}}
+<section class="pane">
+  {{range .Diff}}
+  <details class="file" open>
+    <summary><span class="fpath">{{.Path}}</span><span class="add">+{{.Add}}</span><span class="del">−{{.Del}}</span></summary>
+    <pre class="diff">{{range .Lines}}<span class="{{.Kind}}">{{.Text}}</span>{{end}}</pre>
+    {{if .Truncated}}<p class="muted small">Long file shortened.</p>{{end}}
+  </details>
+  {{else}}<p class="muted">No changes yet.</p>{{end}}
+</section>
+{{else if eq .Tab "checks"}}
+<section class="pane">
+  {{if .Checks}}
+  <ul class="checks">
+    {{range .Checks}}
+    <li>
+      <div class="crow"><span class="dot {{.Tone}}"></span><b>{{.Name}}</b><span class="muted">{{.Summary}}{{if .Reused}} · reused{{end}}</span><span class="verdict {{.Tone}}">{{.Verdict}}</span></div>
+      {{range .Findings}}<div class="finding"><code>{{.Rule}}</code><span class="where">{{.Where}}</span><span>{{.Message}}</span></div>{{end}}
+    </li>
+    {{end}}
+  </ul>
+  <p class="muted small">Attempt {{.Attempt}}</p>
+  {{else}}<p class="muted">Checks run after the change is built.</p>{{end}}
+</section>
+{{else}}
+<section class="pane">
+  <ol class="timeline" data-live>
+    {{range .Activity}}<li><span class="dot {{.Tone}}"></span><span>{{.Text}}</span><time>{{.When}}</time></li>{{end}}
+  </ol>
+</section>
+{{end}}
+{{end}}

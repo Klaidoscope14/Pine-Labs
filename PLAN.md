@@ -782,7 +782,126 @@ Every step adds Grafana panels for time per stage (planning, Developer turns, to
 - `make phase1` and `make phase2-offline` still pass.
 - A two-run lease conflict is demonstrated.
 
-### 10.7 Lessons from Razorpay engineering (read 2026-11-22)
+### 10.7 Phase 4 design: web app, eval and proof
+
+**Goal:** a reviewer can do everything in the browser: submit a ticket, watch the run, read the evidence, approve or reject, and stop everything. The numbers (benchmark, load, DR, red team) are measured, not claimed.
+
+#### Web app: decisions
+- **Server-rendered by the Go API, not Next.js.** The original plan said Next.js, but a fintech control plane shouldn't pull ~1,000 npm packages into its supply chain, and one Go binary is simpler to ship behind the Session Manager tunnel. Pages are `html/template` plus one small vanilla-JS file (command palette, live updates); there's no build step.
+- **Look and feel inspired by Linear:** near-black surfaces, the Inter font, one accent colour, a thin left sidebar, compact list rows, keyboard-first (⌘K palette, `C` for a new run).
+- **Simple by rule:** one job per page, at most one primary action visible, detail behind tabs, no paragraphs of text. Every status is a coloured dot plus one word.
+
+#### Update: Next.js frontend on Vercel (2026-11-22, by request)
+The reviewer UI is now also a **Next.js 15 + TypeScript** app in `web/`, deployed on **Vercel**. The Go-rendered pages stay as the private operator console through the SSM tunnel.
+
+    browser ──HTTPS──▶ Next.js (Vercel, bom1) ──HTTPS + service token──▶ CloudFront ──HTTP, firewalled──▶ Aegis API (EC2:8480)
+
+- **Backend-for-frontend:** the browser only talks to Next.js. Server components and server actions call the Go API with `X-Aegis-Service-Token` plus `X-Aegis-User`, so the token never reaches the browser.
+- **Sessions:** an HMAC-signed HttpOnly cookie on Vercel. The demo user picker sits behind an **access code**.
+- **Passkeys:** the WebAuthn RP is the Vercel domain (`AEGIS_WEBAUTHN_ORIGIN`). Ceremonies are proxied by four allow-listed routes and verified by the Go API.
+- **Reaching the API:** CloudFront (HTTPS, no caching) → an Elastic IP. The security group admits only CloudFront's origin-facing prefix list on 8480, and the API refuses any off-host request without CloudFront's secret `X-Origin-Verify` header (constant-time compare). Loopback (the SSM tunnel) still works.
+- **Residual risk (documented):** without a custom domain, the CloudFront → EC2 hop is plain HTTP inside AWS. A domain plus an ACM certificate on an ALB removes it.
+- **Data leaves India:** Vercel and CloudFront edges are global, which is accepted for this deployment (per the owner).
+- **Tests:** Go tests for the service token, the origin check and loopback; a browser run on the production build (wrong access code refused; sign-in; live run page; maker-checker; approval through a server action; merged).
+
+#### User journey (three steps)
+1. **New run** (`C` or the button): one text box for the ticket, a repo picker, Submit. The page goes straight to the run.
+2. **Watch:** the run page shows the title, one status word, and a 5-step strip (Analyse → Plan → Build → Checks → Review) that updates live. Nothing else is needed while it works.
+3. **Decide:** when it reaches Review, the sidebar's Review count goes up. The run page shows **Approve** / **Reject**, how many approvals the risk tier needs, and who has approved. Tabs hold the detail: *Overview* (summary, risks, cost), *Changes* (diff), *Checks* (gates, findings), *Activity* (audit timeline).
+
+#### Pages
+| Page | Content |
+|---|---|
+| Sidebar | Runs, Review (count), New run, Settings; the current user at the bottom |
+| `/runs` | Three tabs (Active, Review, Done); rows: status dot, title, risk tier, cost, age |
+| `/runs/{id}` | Header, step strip, the decision bar in review, four tabs |
+| `/new` | Ticket box, repo, Submit |
+| `/settings` | Kill switch (operators only, confirm with a reason), the user switcher |
+
+#### API and security
+- JSON API (also used by the k6 load test): `POST /api/runs` (idempotent intake), `GET /api/runs`, `GET /api/runs/{id}`, `POST /api/runs/{id}/decision`, `POST /api/kill`, `GET /api/runs/{id}/events` (server-sent events).
+- **Identity:** demo users and roles from config (`api.users`: requester / reviewer / operator), chosen at a sign-in page and kept in an HMAC-signed, HttpOnly, SameSite=Strict cookie. Passkeys replace this in Phase 5. The API listens only on 127.0.0.1 (reached through the SSM tunnel).
+- **Maker-checker in both places:** the workflow enforces it (§10.6); the UI also hides Approve from the submitter and says why.
+- CSRF token on every form, a strict CSP (`default-src 'self'`, no inline script), and security headers. Every page and API call is tenant-scoped through the ledger's RLS.
+- Live updates use server-sent events that poll the ledger every 2 s. NATS JetStream replaces the polling when run volume needs it.
+
+#### The rest of Phase 4
+| Item | Design |
+|---|---|
+| Benchmark harness | `make benchmark`: scenarios × models (Sonnet 5.5 via Claude Code, DeepSeek V4.1 Flash) × N runs, read from the ledger. The report gives the pass rate, attempts, calls, tokens, wall time, **cost per run and cost per successful change**, and wasted spend |
+| Metrics and Grafana | OpenTelemetry metrics from the worker and API (runs by status, time per stage, model latency, tokens and cost by provider, gate durations, sandbox queue wait), with the cardinality rule (no run IDs in labels, §10.9 R1). A provisioned dashboard |
+| Load test | A fake model provider (recorded responses) plus k6 against `POST /api/runs`, `load.concurrent_runs` at a time; reports throughput, p95 time per stage, and errors |
+| DR drill | A scripted simulation: snapshot the ledger, destroy it, restore it, then `verify-chain` and replay the run state |
+| Red-team table | Adversarial tickets (prompt injection in the repo, bait to skip a test, bait to add a dependency, secret exfiltration) through the eval harness; the table shows the expected and actual block |
+
+#### Status (2026-11-22)
+- **Web app and API: built and tested in the browser.**
+  - Pages: sign-in, Runs (Active / Review / Done), the run page (step strip, decision bar, Overview / Changes / Checks / Activity), New run, Settings with the kill switch, the ⌘K palette, and `C` for a new run.
+  - Live updates through server-sent events.
+  - A full journey worked: Meera submits (a high-risk run that needs 2 approvals) → the UI hides Approve from her ("You submitted this run…") → Vikram approves (1 of 2) → Sana approves → Approved.
+  - Kill switch through the API: on, then the banner, then off. A POST without CSRF is refused (403). Roles are enforced. Strict CSP on every response.
+  - Unit tests: session forgery and wrong-key rejection, CSRF, security headers, maker-checker messages, the step strip, titles, collapsed activity lines.
+  - Kill and reconcile moved into `internal/ops`, shared by the CLI and the API.
+- **Still to do:** benchmark harness, metrics and dashboard, load test, red team, DR drill.
+
+#### Build order
+1. API plus web UI.
+2. Benchmark harness.
+3. Metrics and dashboard.
+4. Load test.
+5. Red team.
+6. DR drill.
+
+### 10.8 Phase 5 design: passkey approvals, OPA policy, merge queue
+
+**Goal:** close the last gaps between "approved" and "safely in main". Approvals become cryptographic, approval rules become reviewable policy-as-code, and approved changes land on `main` one at a time, each re-tested against the real tip.
+
+#### 1. Approval policy as code (OPA / Rego)
+- **Why:** approval rules (who may approve, how many, maker-checker, freezes) are the most audited rules in a fintech change process. As Rego they live in one reviewable file with their own tests, and compliance can read and change them without touching Go.
+- **Design:** `policies/approval.rego` (package `aegis.approval`) decides each human decision.
+  - **Input:** the run (risk tier, submitter), the decision (reviewer, roles, approve/reject, passkey-verified), the approvals so far, the time, and the freeze windows.
+  - **Output:** `accept` (with a reason when refused) and `satisfied` (enough approvals).
+  - The workflow calls an activity, `DecidePolicy`, for each decision, so the workflow stays deterministic. The policy file's hash is recorded with every decision.
+  - The Go rules from Phase 3 stay as a fallback when no policy is configured.
+- **Rules in the first policy:** a reviewer role is required; the submitter can never approve; one vote per reviewer; `high` risk needs 2 distinct approvers; approvals inside a freeze window are refused; passkey-verified approvals are required when `approval.require_passkey` is on.
+- **Tests:** Rego unit tests (`opa test`-style `test_` rules) run from Go (`go test ./internal/policy`).
+
+#### 2. Passkey-signed approvals (WebAuthn)
+- **Why:** a stolen browser session or a forged API call must not be able to approve a change to payment code. A passkey approval proves a person with a registered authenticator approved *this exact change*.
+- **Design:**
+  - Users register a passkey in Settings (WebAuthn registration; credentials stored in the ledger table `passkeys`, under RLS).
+  - **Approving needs a fresh assertion whose challenge is bound to the change:** `sha256(run_id ‖ base_sha ‖ head_sha ‖ evidence_hash ‖ nonce)`.
+  - The API verifies the assertion (signature, origin, RP ID, sign counter) before it signals the workflow. The decision then carries `passkey: true` and the credential ID.
+  - The assertion is stored in the ledger next to the approval for non-repudiation.
+  - The RP ID is `localhost`, which browsers allow without TLS, matching the SSM-tunnel setup. Production sets the real domain.
+- **Library:** `github.com/go-webauthn/webauthn` (the standard Go implementation).
+- **Rollout:** `approval.require_passkey: false` locally, so demos work without hardware; `true` on AWS once reviewers have registered.
+
+#### 3. Merge queue
+- **Why:** two changes can each pass alone and break `main` together, and `main` moves while a change waits for review. A queue serialises merges and re-tests each against the current tip.
+- **Design:**
+  - One long-running Temporal workflow per repo (`merge-queue-<repo>`), fed by signal-with-start when a run is approved.
+  - For each entry in order: fetch the tip, rebase the run branch onto it, re-run tier 1 and the security tier on the result, then fast-forward `main` on the code host (the local bare repo; on GitHub, the native merge queue does the same job).
+  - **On failure:** the run gets `MERGE_FAILED` with the reason, `main` is untouched, and the queue moves on.
+  - **On success:** `MERGED`, with the merged commit recorded.
+  - The kill switch pauses the queue.
+- **UI:** a "Merged" / "Merge failed" status, and a queue position while waiting.
+
+#### Status (2026-11-22): built and tested
+- **OPA policy:** `policies/approval.rego` with 10 Rego unit tests (all pass via `go test ./internal/policy`). Workflow test: a non-passkey approval is refused when passkeys are required, then two passkey approvals satisfy the policy. Live: the worker loaded the policy, and every decision is in the audit log as `policy.decided` with the policy hash.
+- **Passkeys:** registration and change-bound approvals (challenge = sha256(run, base, head, evidence, nonce)). The API verifies the assertion and re-checks that the change didn't move before signalling. A Go test with a software authenticator (real ES256, CBOR, signatures) proves a valid approval is accepted, and that a signature over another change, an unregistered key and a wrong origin are refused, and that ceremonies are single-use. The UI has Settings → Add passkey and "Approve with passkey" (Touch ID / Windows Hello / security key). `require_passkey` stays off locally.
+- **Merge queue:** a per-repo `AegisMergeQueue` workflow (signal-with-start, FIFO, one at a time, continue-as-new every 50, idle exit after 24 h).
+  - Tests: merges happen in order with a peak concurrency of 1, an infrastructure failure is recorded as `MERGE_FAILED`, and approved runs are enqueued.
+  - Live: run A was approved by two reviewers and merged into `main` (the demo repo) after a rebase and re-test.
+  - Run B (same edits, built on the old `main`) was caught by the Phase 3 base-moved check (`ESCALATED_HUMAN`), and `main` was untouched. The demo repo's `main` was then restored to the seed commit.
+- **AWS:** systemd services for the worker and the web app (`GOMEMLIMIT` set). `scripts/aws.sh web` tunnels the UI to `http://localhost:8480`, and `scripts/aws.sh services` shows their status.
+
+#### Done when
+- Policy tests pass, including every refusal path.
+- A passkey registration and signed approval work in the browser (Chrome's virtual authenticator), and an approval without a passkey is refused when it's required.
+- Two approved runs merge in order, and a run that conflicts with the new tip gets `MERGE_FAILED` while `main` stays intact.
+
+### 10.9 Lessons from Razorpay engineering (read 2026-11-22)
 Razorpay runs payments at Indian scale on Go, AWS and Kubernetes, so their engineering blog is a close match for our stack and regulator. These are the ideas worth adopting, each tied to its post:
 
 | # | Idea | Source post | Where it lands |
