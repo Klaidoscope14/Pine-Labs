@@ -85,19 +85,43 @@ Useful checks: `make test` (all unit tests), `make phase1` (full deterministic p
 ## How it's built
 
 ```text
-Browser ──▶ Next.js on Vercel ──▶ CloudFront ──▶ Aegis API (Go) on AWS EC2, Mumbai
-                                                     │
-                     Temporal workflow ◀─────────────┤──▶ Postgres ledger (tamper-evident)
-                          │                          │
-          AI agents (DeepSeek / Claude) ── gateway ──┴──▶ gVisor sandboxes running the checks
+┌────────────────────────────────── Reviewer experience ──────────────────────────────────┐
+│  Browser  ── HTTPS ──▶  Next.js reviewer app (Vercel)                                   │
+│                                  │ server-to-server only                                │
+└──────────────────────────────────┼──────────────────────────────────────────────────────┘
+                                   HTTPS + service token
+                                           │
+                                  CloudFront (origin guard)
+                                           │
+┌────────────────────────── Aegis control plane · AWS Mumbai ─────────────────────────────┐
+│                              ▼                                                           │
+│  Go API ──▶ Temporal workflow ──▶ Go worker                                              │
+│    │                 │                  │                                                │
+│    │                 │                  ├──▶ Policy: OPA/Rego + WebAuthn approvals       │
+│    │                 │                  ├──▶ Restricted agent gateway ──▶ LLM providers  │
+│    │                 │                  └──▶ Merge queue ──▶ protected main branch       │
+│    │                 │                                                                   │
+│    └─────────────────┴──▶ Postgres ledger: tenant isolation + hash-chained audit log     │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                           │
+┌────────────────────────────── Execution trust boundary ──────────────────────────────────┐
+│  Fresh gVisor sandbox · no network · non-root · CPU/memory/output limits                 │
+│       └──▶ tests · hidden oracle tests · Semgrep · secrets · OpenAPI · replay checks     │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+                                           │
+              OpenTelemetry ──▶ Jaeger + Prometheus + Grafana
 ```
 
-- **Go + Temporal** for the workflow, so runs survive crashes and never do a step twice.
-- **Postgres** with row-level security per team and a hash-chained audit log.
-- **gVisor sandboxes** with no network for every check.
-- **OPA/Rego** for approval rules, **WebAuthn passkeys** for signed approvals.
-- **Next.js + TypeScript** frontend on Vercel; the browser never talks to the API directly.
-- **OpenTelemetry, Prometheus, Grafana, Jaeger** for observability.
+The browser never talks directly to the Go API. The Next.js app holds the service token,
+CloudFront authenticates the origin request, and the API accepts only that protected path.
+For local development, the same control-plane services run with Docker Compose and the
+reviewer app runs on localhost.
+
+- **Go + Temporal**: durable workflow execution, retries, and human-approval waits.
+- **Postgres**: row-level tenant isolation and a tamper-evident, hash-chained audit record.
+- **Gateway + gVisor**: scoped agent tools and a no-network sandbox for every check.
+- **OPA/Rego + WebAuthn**: review policy and optionally passkey-bound approvals.
+- **Next.js + TypeScript**: reviewer interface; **OpenTelemetry, Prometheus, Grafana, Jaeger**: observability.
 
 | Folder | What's inside |
 |---|---|
